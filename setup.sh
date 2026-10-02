@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # StackTunnel installer / manager
 # Usage:  sudo bash setup.sh
-# Put main.go (or StackTunnel.go) or a compiled binary next to this script.
+# The binary is downloaded from GitHub Releases automatically (and verified with
+# SHA256SUMS). To install offline, put a binary named "stacktunnel" next to this script.
 
 set -u
 
@@ -81,7 +82,16 @@ gen_key() {
   else head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; fi
 }
 
-# ---------- Go toolchain ----------
+# ---------- binary ----------
+
+REPO="${STACKTUNNEL_REPO:-stacktunnel/Tunnel}"
+if [[ -n "${STACKTUNNEL_BASE_URL:-}" ]]; then
+  BASE_URL="$STACKTUNNEL_BASE_URL"
+elif [[ -n "${STACKTUNNEL_VERSION:-}" ]]; then
+  BASE_URL="https://github.com/${REPO}/releases/download/${STACKTUNNEL_VERSION}"
+else
+  BASE_URL="https://github.com/${REPO}/releases/latest/download"
+fi
 
 fetch() { # fetch URL OUTFILE
   if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
@@ -91,105 +101,52 @@ fetch() { # fetch URL OUTFILE
   else wget -q -T 300 -O "$2" "$1"; fi
 }
 
-go_ok() { # Go >= 1.18 available?
-  command -v go >/dev/null 2>&1 || return 1
-  local v; v="$(go version | sed -E 's/.*go1\.([0-9]+).*/\1/')"
-  [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 18 ))
-}
-
-apt_install_go() {
-  info "Trying to install Go with apt ..."
-  apt-get update -qq >/dev/null 2>&1
-  local pkg d
-  for pkg in golang-1.22-go golang-1.21-go golang-1.20-go golang-go; do
-    if apt-get install -y -qq "$pkg" >/dev/null 2>&1; then
-      for d in $(ls -d /usr/lib/go-*/bin 2>/dev/null | sort -V); do export PATH="$d:$PATH"; done
-      if go_ok; then ok "Installed via apt ($pkg): $(go version)"; return 0; fi
-    fi
-  done
-  return 1
-}
-
-ensure_go() {
-  [[ -x /usr/local/go/bin/go ]] && export PATH="/usr/local/go/bin:$PATH"
-  go_ok && return 0
-
-  info "Go (>= 1.18) not found. Trying to install it ..."
-  local arch ver url tmp
+download_binary() {
+  local arch asset tmp expected actual
   case "$(uname -m)" in
-    x86_64) arch=amd64 ;;
+    x86_64|amd64)  arch=amd64 ;;
     aarch64|arm64) arch=arm64 ;;
+    armv7l)        arch=armv7 ;;
     *) err "Unsupported CPU architecture: $(uname -m)"; return 1 ;;
   esac
+  asset="stacktunnel-linux-${arch}"
   tmp="$(mktemp -d)"
-  ver=""
-  if fetch "https://go.dev/VERSION?m=text" "$tmp/ver" 2>/dev/null; then ver="$(head -n1 "$tmp/ver")"; fi
-  [[ "$ver" =~ ^go1\.[0-9]+(\.[0-9]+)?$ ]] || ver=""
-  # try the detected latest version first, then known-good versions; two mirrors each
-  local got=0 v base
-  for v in $ver go1.23.4 go1.22.5; do
-    for base in "https://go.dev/dl" "https://dl.google.com/go"; do
-      url="${base}/${v}.linux-${arch}.tar.gz"
-      info "Downloading $url"
-      if fetch "$url" "$tmp/go.tgz" && tar -tzf "$tmp/go.tgz" >/dev/null 2>&1; then got=1; break 2; fi
-    done
-  done
-  if (( got == 0 )); then
-    warn "Direct download failed; falling back to apt."
+
+  info "Downloading ${BASE_URL}/${asset} ..."
+  if ! fetch "${BASE_URL}/${asset}" "$tmp/$asset" || ! fetch "${BASE_URL}/SHA256SUMS" "$tmp/SHA256SUMS"; then
+    err "Download failed (github.com may be unreachable from this server)."
+    echo "   Workaround: download '${asset}' on a machine that can reach GitHub, then copy it"
+    echo "   to this server next to setup.sh, renamed to 'stacktunnel', and run setup.sh again:"
+    echo "     scp ${asset} root@THIS_SERVER:~/stacktunnel"
     rm -rf "$tmp"
-    apt_install_go && return 0
-    err "Could not install Go (download and apt both failed)."
-    echo "   Workaround: build the binary on a server that has internet access:"
-    echo "     (on that server)  bash setup.sh   # it will install Go and build"
-    echo "     then copy /usr/local/bin/stacktunnel to this server next to setup.sh, e.g.:"
-    echo "     scp /usr/local/bin/stacktunnel root@THIS_SERVER:~/stacktunnel/"
     return 1
   fi
-  rm -rf /usr/local/go
-  tar -C /usr/local -xzf "$tmp/go.tgz" || { err "Failed to extract Go archive."; rm -rf "$tmp"; return 1; }
+
+  expected="$(awk -v f="$asset" '$2==f || $2==("*" f) {print $1}' "$tmp/SHA256SUMS")"
+  actual="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
+  if [[ -z "$expected" || "$expected" != "$actual" ]]; then
+    err "Checksum verification FAILED for ${asset}. The file was not installed."
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  install -m 0755 "$tmp/$asset" "$BIN"
   rm -rf "$tmp"
-  export PATH="/usr/local/go/bin:$PATH"
-  if go_ok; then ok "Installed $(go version)"; return 0; fi
-  err "Go installation failed."
-  return 1
+  ok "Downloaded and verified ${asset}"
 }
 
-# ---------- binary ----------
-
-install_binary() {
-  local src=""
-  for f in stacktunnel StackTunnel tunnel myapp; do
-    if [[ -f "$SCRIPT_DIR/$f" && -x "$SCRIPT_DIR/$f" ]]; then src="$SCRIPT_DIR/$f"; break; fi
-  done
-  if [[ -n "$src" ]]; then
-    install -m 0755 "$src" "$BIN"
-    ok "Installed binary from $src"
-    return 0
+install_binary() { # install_binary [force]  (force = always download)
+  if [[ "${1:-}" != "force" ]]; then
+    local f
+    for f in stacktunnel StackTunnel tunnel; do
+      if [[ -f "$SCRIPT_DIR/$f" ]]; then
+        install -m 0755 "$SCRIPT_DIR/$f" "$BIN"
+        ok "Installed local binary: $SCRIPT_DIR/$f"
+        return 0
+      fi
+    done
   fi
-
-  local go_src=""
-  for f in main.go StackTunnel.go tunnel.go; do
-    if [[ -f "$SCRIPT_DIR/$f" ]]; then go_src="$SCRIPT_DIR/$f"; break; fi
-  done
-  if [[ -z "$go_src" ]]; then
-    err "No compiled binary and no main.go found next to this script."
-    echo "   Put main.go next to setup.sh and run again."
-    return 1
-  fi
-  ensure_go || return 1
-
-  info "Building from $go_src ..."
-  export GOPROXY="https://proxy.golang.org,https://goproxy.io,direct"
-  local tmp; tmp="$(mktemp -d)"
-  cp "$go_src" "$tmp/main.go"
-  ( cd "$tmp" && go mod init stacktunnel >/dev/null 2>&1 && { go get github.com/hashicorp/yamux@v0.1.1 golang.org/x/crypto@v0.17.0 2>&1 | tail -n 3; true; } && go mod tidy 2>&1 | tail -n 3 && go build -o stacktunnel . ) || {
-    err "Build failed. Check the output above (Go version: $(go version))."
-    rm -rf "$tmp"
-    return 1
-  }
-  install -m 0755 "$tmp/stacktunnel" "$BIN"
-  rm -rf "$tmp"
-  ok "Built and installed: $BIN"
+  download_binary
 }
 
 # ---------- firewall ----------
@@ -421,7 +378,7 @@ EOF
     done
   fi
   echo
-  echo "Manage with:  bash $0 status | logs | restart | show | uninstall"
+  echo "Manage with:  bash $0 status | logs | restart | update | show | uninstall"
 }
 
 # ---------- manage ----------
@@ -441,6 +398,13 @@ do_status() {
   fi
   echo
   journalctl -u "$SERVICE" -n 10 --no-pager
+}
+
+do_update() {
+  if [[ ! -f "$UNIT" ]]; then err "Service is not installed. Run: sudo bash $0 install"; return 1; fi
+  warn "Versions are not compatible with each other: update the inside AND outside servers."
+  install_binary force || return 1
+  systemctl restart "$SERVICE" && ok "Updated and restarted."
 }
 
 do_show() {
@@ -465,16 +429,18 @@ menu() {
   echo "  2) Status"
   echo "  3) Live log"
   echo "  4) Restart"
-  echo "  5) Show config (includes key)"
-  echo "  6) Uninstall"
+  echo "  5) Update binary (download latest release)"
+  echo "  6) Show config (includes key)"
+  echo "  7) Uninstall"
   echo "  0) Exit"
   case "$(ask "Choice")" in
     1) do_install ;;
     2) do_status ;;
     3) journalctl -u "$SERVICE" -f ;;
     4) systemctl restart "$SERVICE" && ok "Restarted." ;;
-    5) do_show ;;
-    6) do_uninstall ;;
+    5) do_update ;;
+    6) do_show ;;
+    7) do_uninstall ;;
     *) exit 0 ;;
   esac
 }
@@ -485,8 +451,9 @@ case "${1:-}" in
   status)    do_status ;;
   logs)      journalctl -u "$SERVICE" -f ;;
   restart)   systemctl restart "$SERVICE" && ok "Restarted." ;;
+  update)    do_update ;;
   show)      do_show ;;
   uninstall) do_uninstall ;;
   "")        menu ;;
-  *)         echo "Usage: bash $0 [install|status|logs|restart|show|uninstall]" ;;
+  *)         echo "Usage: bash $0 [install|status|logs|restart|update|show|uninstall]" ;;
 esac

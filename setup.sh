@@ -378,7 +378,7 @@ EOF
     done
   fi
   echo
-  echo "Manage with:  bash $0 status | logs | restart | update | show | uninstall"
+  echo "Manage with:  bash $0 status | logs | restart | update | tune | window N | show | uninstall"
 }
 
 # ---------- manage ----------
@@ -386,6 +386,8 @@ EOF
 do_status() {
   if [[ ! -f "$UNIT" ]]; then err "Service is not installed."; return 1; fi
   systemctl --no-pager status "$SERVICE" | head -n 12
+  echo
+  echo "Version: $("$BIN" -version 2>/dev/null || echo unknown)"
   echo
   if [[ -f "$CONF" ]]; then
     # shellcheck disable=SC1090
@@ -403,8 +405,70 @@ do_status() {
 do_update() {
   if [[ ! -f "$UNIT" ]]; then err "Service is not installed. Run: sudo bash $0 install"; return 1; fi
   warn "Versions are not compatible with each other: update the inside AND outside servers."
+  local before; before="$("$BIN" -version 2>/dev/null || echo unknown)"
   install_binary force || return 1
-  systemctl restart "$SERVICE" && ok "Updated and restarted."
+  systemctl restart "$SERVICE" && ok "Updated: ${before}  ->  $("$BIN" -version 2>/dev/null || echo unknown). Service restarted."
+}
+
+do_window() { # do_window N : set -window N in the service and restart
+  local n="${1:-}"
+  if [[ ! "$n" =~ ^[0-9]+$ ]] || (( n < 256 || n > 65536 )); then
+    err "Usage: sudo bash $0 window <KB>   (256 to 65536, e.g. 1024)"; return 1
+  fi
+  if [[ ! -f "$UNIT" ]]; then err "Service is not installed. Run: sudo bash $0 install"; return 1; fi
+  sed -i -E "/^ExecStart=/ { s/ -window [0-9]+//; s/\$/ -window ${n}/ }" "$UNIT"
+  if [[ -f "$CONF" ]]; then
+    sed -i '/^WINDOW=/d' "$CONF"; echo "WINDOW=${n}" >> "$CONF"
+  fi
+  systemctl daemon-reload
+  systemctl restart "$SERVICE" && ok "Window set to ${n} KB and service restarted. Do the same on the other server."
+}
+
+do_tune() {
+  echo
+  echo "${B}====== Speed test: find the best -window value ======${N}"
+  echo "It measures the real path between your two servers with several window sizes"
+  echo "and recommends one (takes about a minute). Run it on BOTH servers:"
+  echo "first on the INSIDE (Iran) server, then on the OUTSIDE server."
+  if [[ ! -x "$BIN" ]]; then err "stacktunnel is not installed yet. Run the install first."; return 1; fi
+
+  local MODE="" KEY="" IRAN_IP="" key port role ip tmp rec
+  # shellcheck disable=SC1090
+  [[ -f "$CONF" ]] && source "$CONF"
+  echo "  1) This is the INSIDE (Iran) server   - waits for the test"
+  echo "  2) This is the OUTSIDE server         - runs the test"
+  while true; do
+    role="$(ask "Choice (1 or 2)")"
+    [[ "$role" == 1 || "$role" == 2 ]] && break
+    err "Enter 1 or 2"
+  done
+  key="${KEY:-}"
+  [[ -n "$key" ]] || key="$(ask "Shared key")"
+  port="$(ask "Port for the test (must be open on the inside server's firewall)" 4100)"
+  valid_port "$port" || { err "Invalid port"; return 1; }
+
+  if [[ "$role" == 1 ]]; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+      confirm "Open TCP ${port} in ufw for the test?" y && ufw allow "${port}/tcp" >/dev/null && ok "tcp ${port} opened (remove later with: ufw delete allow ${port}/tcp)"
+    fi
+    info "Waiting for the test. Now run this script's tune option on the OUTSIDE server."
+    "$BIN" -mode tune-server -key "$key" -tunnel ":${port}"
+  else
+    ip="${IRAN_IP%%,*}"; ip="${ip%%:*}"
+    ip="$(ask "Inside (Iran) server IP" "$ip")"
+    [[ -n "$ip" ]] || { err "IP is required"; return 1; }
+    tmp="$(mktemp)"
+    "$BIN" -mode tune-client -key "$key" -tunnel "${ip}:${port}" 2>&1 | tee "$tmp"
+    rec="$(grep -oE 'Recommended: +-window [0-9]+' "$tmp" | grep -oE '[0-9]+$' | tail -n1)"
+    rm -f "$tmp"
+    if [[ -n "$rec" ]]; then
+      echo
+      if [[ -f "$UNIT" ]] && confirm "Apply -window ${rec} to THIS server's service now?" y; then
+        do_window "$rec"
+      fi
+      warn "Also run on the inside server:  sudo bash $0 window ${rec}"
+    fi
+  fi
 }
 
 do_show() {
@@ -430,8 +494,9 @@ menu() {
   echo "  3) Live log"
   echo "  4) Restart"
   echo "  5) Update binary (download latest release)"
-  echo "  6) Show config (includes key)"
-  echo "  7) Uninstall"
+  echo "  6) Speed test / choose window size"
+  echo "  7) Show config (includes key)"
+  echo "  8) Uninstall"
   echo "  0) Exit"
   case "$(ask "Choice")" in
     1) do_install ;;
@@ -439,8 +504,9 @@ menu() {
     3) journalctl -u "$SERVICE" -f ;;
     4) systemctl restart "$SERVICE" && ok "Restarted." ;;
     5) do_update ;;
-    6) do_show ;;
-    7) do_uninstall ;;
+    6) do_tune ;;
+    7) do_show ;;
+    8) do_uninstall ;;
     *) exit 0 ;;
   esac
 }
@@ -452,8 +518,10 @@ case "${1:-}" in
   logs)      journalctl -u "$SERVICE" -f ;;
   restart)   systemctl restart "$SERVICE" && ok "Restarted." ;;
   update)    do_update ;;
+  tune)      do_tune ;;
+  window)    do_window "${2:-}" ;;
   show)      do_show ;;
   uninstall) do_uninstall ;;
   "")        menu ;;
-  *)         echo "Usage: bash $0 [install|status|logs|restart|update|show|uninstall]" ;;
+  *)         echo "Usage: bash $0 [install|status|logs|restart|update|tune|window N|show|uninstall]" ;;
 esac

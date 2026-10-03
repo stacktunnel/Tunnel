@@ -1,5 +1,5 @@
 # StackTunnel
-https://t.me/StackTunnel
+
 **English** | [فارسی](README.fa.md)
 
 A small reverse TCP/UDP tunnel for restricted networks. One static binary, one shared key, and an interactive installer that sets it up as a systemd service.
@@ -150,6 +150,7 @@ Users connect to `INSIDE_IP:443` (TCP) or `INSIDE_IP:51820` (UDP) and reach `127
 | `-pad` | both | Maximum random padding per frame in bytes (default `128`, `0` = off, max `4096`) |
 | `-conns` | client | Parallel tunnel connections per inside server (default `4`) |
 | `-bind` | server | IP the user-facing ports listen on (default: all interfaces) |
+| `-window` | both | Per-stream window in KB (default `1024`). Use `256` on slow or unstable links, larger values (up to `8192`) only on fast, high-latency links |
 
 ### Several servers
 
@@ -157,6 +158,33 @@ Users connect to `INSIDE_IP:443` (TCP) or `INSIDE_IP:51820` (UDP) and reach `127
 - The **client's** `-ports` / `-udp` decide what it can serve. If it connects to several inside servers, give it the combined list of ports.
 - A user connection is sent only to an outside server that serves that port. If several do, the load is shared.
 - Port numbers are the same on both sides; there is no port remapping.
+
+## Choosing the window size (speed test)
+
+`-window` controls how much data each connection may have in flight. A **bigger** window is faster on fast links with high latency, but makes delays under load worse on slow or congested links. The best value depends on your path, so measure it:
+
+```bash
+sudo bash setup.sh tune
+```
+
+Run it on the **inside** server first (choose 1, it waits), then on the **outside** server (choose 2). After about a minute the outside server prints a table like this and a recommendation:
+
+```
+  -window   256 :     39.1 Mbit/s | idle RTT  201 ms | RTT under load: median   202 ms
+  -window  1024 :     77.9 Mbit/s | idle RTT  201 ms | RTT under load: median   395 ms
+  -window  4096 :     78.2 Mbit/s | idle RTT  201 ms | RTT under load: median   785 ms
+  -window  8192 :     78.1 Mbit/s | idle RTT  201 ms | RTT under load: median  1386 ms
+
+Recommended:  -window 1024
+```
+
+(Example from a simulated link, not from a real network.) The recommendation is the smallest window that reaches at least 90% of the best speed. It offers to apply the value for you; apply the **same value on both servers**:
+
+```bash
+sudo bash setup.sh window 1024
+```
+
+The test uses a separate port (default `4100`, open it on the inside server's firewall) and does not disturb the running tunnel. It measures the download direction (outside to inside) with 4 parallel streams.
 
 ## Troubleshooting
 

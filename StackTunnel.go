@@ -22,9 +22,12 @@ import (
 	"log"
 	mrand "math/rand"
 	"net"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -44,6 +47,31 @@ const (
 
 // max random padding bytes added to every encrypted frame (0 = off)
 var padMax = 128
+
+// per-stream flow-control window in KB. Large values help fast, high-latency
+// links but cause long stalls and false disconnects on slow or congested ones.
+var windowKB = 1024
+
+// version is set at build time: -ldflags "-X main.version=v0.1.0"
+var version = "dev"
+
+var (
+	logMu   sync.Mutex
+	logLast = map[string]time.Time{}
+)
+
+// logOnce logs a message at most once per 10s per key (avoids log floods).
+func logOnce(key, format string, a ...interface{}) {
+	logMu.Lock()
+	t, ok := logLast[key]
+	if ok && time.Since(t) < 10*time.Second {
+		logMu.Unlock()
+		return
+	}
+	logLast[key] = time.Now()
+	logMu.Unlock()
+	log.Printf(format, a...)
+}
 
 // address the user-facing ports bind to on the server ("" = all interfaces)
 var bindAddr = ""
@@ -389,8 +417,8 @@ func (s *secConn) Read(p []byte) (int, error) {
 func yamuxCfg() *yamux.Config {
 	c := yamux.DefaultConfig()
 	c.KeepAliveInterval = 15 * time.Second
-	c.ConnectionWriteTimeout = 20 * time.Second
-	c.MaxStreamWindowSize = 8 << 20
+	c.ConnectionWriteTimeout = 60 * time.Second // tolerate a congested link before giving up
+	c.MaxStreamWindowSize = uint32(windowKB) * 1024
 	c.LogOutput = io.Discard
 	return c
 }
@@ -574,11 +602,13 @@ func serveExposed(port int, p *pool) {
 			tune(c)
 			sess := p.pick(protoTCP, port)
 			if sess == nil {
+				logOnce(fmt.Sprintf("notun-tcp-%d", port), "tcp :%d: connection from %s dropped, no kharej client has announced this port (is the client connected with -ports including %d?)", port, c.RemoteAddr(), port)
 				c.Close()
 				return
 			}
 			st, err := sess.Open()
 			if err != nil {
+				logOnce("open-stream", "cannot open tunnel stream: %v", err)
 				c.Close()
 				return
 			}
@@ -804,11 +834,13 @@ func clientOnce(addr, psk string, allowed, allowedUDP map[int]bool) error {
 				return
 			}
 			if hdr[0] != protoTCP || !allowed[port] {
+				logOnce(fmt.Sprintf("notallowed-%d", port), "request for tcp port %d refused: not in this client's -ports", port)
 				st.Close()
 				return
 			}
 			t, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 10*time.Second)
 			if err != nil {
+				logOnce(fmt.Sprintf("dial-%d", port), "cannot connect to local service 127.0.0.1:%d: %v (is the real service running and listening on 127.0.0.1?)", port, err)
 				st.Close()
 				return
 			}
@@ -855,6 +887,311 @@ func runClient(addr, psk string, ports, udpPorts []int, conns int) {
 	select {}
 }
 
+// ---------- window tuning (speed test) ----------
+//
+// "tune-server" (inside) and "tune-client" (outside) measure the real path with
+// several window sizes and recommend one. Download direction (outside -> inside),
+// several parallel streams, while probing the delay a small request would see.
+
+const (
+	tuneStreams = 4
+	tuneWarmup  = 2 * time.Second
+	tuneMeasure = 8 * time.Second
+)
+
+type tuneResult struct {
+	windowKB int
+	mbit     float64
+	idle     time.Duration
+	medLoad  time.Duration
+	maxLoad  time.Duration
+	err      error
+}
+
+func medianMax(d []time.Duration) (time.Duration, time.Duration) {
+	if len(d) == 0 {
+		return 0, 0
+	}
+	c := append([]time.Duration(nil), d...)
+	sort.Slice(c, func(i, j int) bool { return c[i] < c[j] })
+	return c[len(c)/2], c[len(c)-1]
+}
+
+// tuneServeConn handles one trial; it returns true when the client says "finished".
+func tuneServeConn(c net.Conn, psk string) bool {
+	defer c.Close()
+	tune(c)
+	sc, err := handshake(c, psk, false)
+	if err != nil {
+		log.Printf("speed test: handshake failed: %v", err)
+		return false
+	}
+	c.SetReadDeadline(time.Now().Add(15 * time.Second))
+	var wb [4]byte
+	if _, err := io.ReadFull(sc, wb[:]); err != nil {
+		return false
+	}
+	c.SetReadDeadline(time.Time{})
+	win := int(binary.BigEndian.Uint32(wb[:]))
+	if win == 0 {
+		return true // finish marker
+	}
+	if win < 256 || win > 65536 {
+		return false
+	}
+	cfg := yamuxCfg()
+	cfg.MaxStreamWindowSize = uint32(win) * 1024
+	sess, err := yamux.Server(sc, cfg)
+	if err != nil {
+		return false
+	}
+	defer sess.Close()
+	timer := time.AfterFunc(tuneWarmup+tuneMeasure+40*time.Second, func() { sess.Close() })
+	defer timer.Stop()
+
+	ctrl, err := sess.Accept()
+	if err != nil {
+		return false
+	}
+	var total int64
+	go func() {
+		for {
+			st, err := sess.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				buf := make([]byte, 64<<10)
+				for {
+					n, err := st.Read(buf)
+					atomic.AddInt64(&total, int64(n))
+					if err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	for atomic.LoadInt64(&total) == 0 { // wait for the first data
+		select {
+		case <-sess.CloseChan():
+			return false
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	time.Sleep(tuneWarmup)
+	b1 := atomic.LoadInt64(&total)
+	time.Sleep(tuneMeasure)
+	b2 := atomic.LoadInt64(&total)
+	var out [8]byte
+	binary.BigEndian.PutUint64(out[:], uint64(b2-b1))
+	ctrl.Write(out[:])
+	ctrl.SetReadDeadline(time.Now().Add(15 * time.Second))
+	io.Copy(io.Discard, ctrl) // wait for the client to hang up
+	return false
+}
+
+func tuneServer(addr, psk string) {
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("speed test server listening on %s; now run the tune-client on the other server", addr)
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			continue
+		}
+		go func() {
+			if tuneServeConn(c, psk) {
+				log.Printf("speed test finished")
+				time.Sleep(300 * time.Millisecond)
+				os.Exit(0)
+			}
+		}()
+	}
+}
+
+func tuneTrial(addr, psk string, win int) (r tuneResult) {
+	r.windowKB = win
+	c, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		r.err = err
+		return
+	}
+	defer c.Close()
+	tune(c)
+	sc, err := handshake(c, psk, true)
+	if err != nil {
+		r.err = err
+		return
+	}
+	var wb [4]byte
+	binary.BigEndian.PutUint32(wb[:], uint32(win))
+	if _, err := sc.Write(wb[:]); err != nil {
+		r.err = err
+		return
+	}
+	cfg := yamuxCfg()
+	cfg.MaxStreamWindowSize = uint32(win) * 1024
+	sess, err := yamux.Client(sc, cfg)
+	if err != nil {
+		r.err = err
+		return
+	}
+	defer sess.Close()
+	ctrl, err := sess.Open()
+	if err != nil {
+		r.err = err
+		return
+	}
+
+	var idle []time.Duration
+	for i := 0; i < 5; i++ {
+		d, err := sess.Ping()
+		if err != nil {
+			r.err = err
+			return
+		}
+		idle = append(idle, d)
+		time.Sleep(100 * time.Millisecond)
+	}
+	r.idle, _ = medianMax(idle)
+
+	stop := make(chan struct{})
+	defer close(stop)
+	payload := make([]byte, 64<<10)
+	rand.Read(payload)
+	for i := 0; i < tuneStreams; i++ {
+		st, err := sess.Open()
+		if err != nil {
+			r.err = err
+			return
+		}
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := st.Write(payload); err != nil {
+					return
+				}
+			}
+		}()
+	}
+
+	start := time.Now()
+	var mu sync.Mutex
+	var loaded []time.Duration
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(250 * time.Millisecond):
+			}
+			d, err := sess.Ping()
+			if err != nil {
+				return
+			}
+			if time.Since(start) > tuneWarmup {
+				mu.Lock()
+				loaded = append(loaded, d)
+				mu.Unlock()
+			}
+		}
+	}()
+
+	var out [8]byte
+	ctrl.SetReadDeadline(time.Now().Add(tuneWarmup + tuneMeasure + 40*time.Second))
+	if _, err := io.ReadFull(ctrl, out[:]); err != nil {
+		r.err = err
+		return
+	}
+	r.mbit = float64(binary.BigEndian.Uint64(out[:])) * 8 / tuneMeasure.Seconds() / 1e6
+	mu.Lock()
+	r.medLoad, r.maxLoad = medianMax(loaded)
+	mu.Unlock()
+	return
+}
+
+func tuneFinish(addr, psk string) {
+	c, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	sc, err := handshake(c, psk, true)
+	if err != nil {
+		return
+	}
+	sc.Write([]byte{0, 0, 0, 0})
+	time.Sleep(300 * time.Millisecond)
+}
+
+func parseWindows(s string) []int {
+	var out []int
+	for _, f := range strings.Split(s, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(f))
+		if err != nil || n < 256 || n > 65536 {
+			log.Fatalf("bad -windows value %q (each must be 256..65536 KB)", f)
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+func ms(d time.Duration) int { return int(d / time.Millisecond) }
+
+func tuneClient(addr, psk string, windows []int) {
+	fmt.Printf("Speed test to %s: download direction, %d parallel streams, about %d s per setting\n\n",
+		addr, tuneStreams, int((tuneWarmup+tuneMeasure)/time.Second)+2)
+	var res []tuneResult
+	for _, w := range windows {
+		fmt.Printf("  -window %5d : ", w)
+		r := tuneTrial(addr, psk, w)
+		if r.err != nil {
+			fmt.Printf("failed (%v)\n", r.err)
+		} else {
+			fmt.Printf("%8.1f Mbit/s | idle RTT %4d ms | RTT under load: median %5d ms, max %5d ms\n",
+				r.mbit, ms(r.idle), ms(r.medLoad), ms(r.maxLoad))
+		}
+		res = append(res, r)
+		time.Sleep(500 * time.Millisecond)
+	}
+	tuneFinish(addr, psk)
+
+	best := 0.0
+	for _, r := range res {
+		if r.err == nil && r.mbit > best {
+			best = r.mbit
+		}
+	}
+	if best == 0 {
+		fmt.Println("\nNo successful measurement. Check the key, the port and the firewall on the inside server.")
+		return
+	}
+	// A bigger window only buys speed, so take the smallest one that gets
+	// within 10% of the best speed measured.
+	rec := -1
+	for i, r := range res {
+		if r.err != nil || r.mbit < 0.9*best {
+			continue
+		}
+		if rec < 0 || r.windowKB < res[rec].windowKB {
+			rec = i
+		}
+	}
+	fmt.Printf("\nRecommended:  -window %d\n", res[rec].windowKB)
+	fmt.Println("(the smallest window that reaches at least 90% of the best speed measured)")
+	fmt.Printf("Apply the SAME value on both servers, e.g.:  sudo bash setup.sh window %d\n", res[rec].windowKB)
+	if res[rec].medLoad > 3*time.Second {
+		fmt.Println("Warning: delays under load are high even with this setting; the link is slow or congested.")
+	}
+}
+
 func main() {
 	mode := flag.String("mode", "", "server (Iran) or client (kharej)")
 	key := flag.String("key", "", "pre-shared key (same on both sides)")
@@ -864,8 +1201,16 @@ func main() {
 	bind := flag.String("bind", "", "server: IP that user-facing ports listen on (default: all)")
 	pad := flag.Int("pad", 128, "max random padding bytes per frame (0 = off, max 4096)")
 	conns := flag.Int("conns", 4, "client: number of parallel tunnel connections")
+	win := flag.Int("window", 1024, "per-stream window in KB (try 256 on slow/unstable links, up to 8192 on fast ones)")
+	windows := flag.String("windows", "256,1024,4096,8192", "tune modes: window sizes (KB) to try")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
-	if *key == "" || *tun == "" || (*ports == "" && *udp == "") {
+	if *showVersion {
+		fmt.Println("stacktunnel", version)
+		return
+	}
+	isTune := *mode == "tune-server" || *mode == "tune-client"
+	if *key == "" || *tun == "" || (!isTune && *ports == "" && *udp == "") {
 		flag.Usage()
 		return
 	}
@@ -873,8 +1218,17 @@ func main() {
 		log.Fatal("-pad must be 0..4096")
 	}
 	padMax = *pad
+	if *win < 256 || *win > 65536 {
+		log.Fatal("-window must be 256..65536 (KB)")
+	}
+	windowKB = *win
 	bindAddr = *bind
+	log.Printf("stacktunnel %s starting (%s)", version, *mode)
 	switch *mode {
+	case "tune-server":
+		tuneServer(*tun, *key)
+	case "tune-client":
+		tuneClient(*tun, *key, parseWindows(*windows))
 	case "server":
 		runServer(*tun, *key, parsePorts(*ports), parsePorts(*udp))
 	case "client":

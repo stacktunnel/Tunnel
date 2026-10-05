@@ -2,8 +2,8 @@
 // First packet is an SSH-2.0 banner sent alone; afterwards everything is
 // AEAD-encrypted and multiplexed with yamux.
 //
-//	Iran:   ./tunnel -mode server -key SECRET -tunnel :4000 -ports 443 -udp 51820 -pad 128
-//	Kharej: ./tunnel -mode client -key SECRET -tunnel IRAN_IP:4000 -ports 443 -udp 51820 -pad 128 -conns 4
+//   Iran:   ./tunnel -mode server -key SECRET -tunnel :4000 -ports 443 -udp 51820 -pad 128
+//   Kharej: ./tunnel -mode client -key SECRET -tunnel IRAN_IP:4000 -ports 443 -udp 51820 -pad 128 -conns 4
 //
 // Users connect to Iran:443 (tcp) / Iran:51820 (udp) -> through the tunnel ->
 // kharej 127.0.0.1:443 / 127.0.0.1:51820.
@@ -52,9 +52,6 @@ var padMax = 128
 // links but cause long stalls and false disconnects on slow or congested ones.
 var windowKB = 1024
 
-var handshakeTimeout = 20 * time.Second
-var debugLogs bool
-
 // version is set at build time: -ldflags "-X main.version=v0.1.0"
 var version = "dev"
 
@@ -82,7 +79,8 @@ var bindAddr = ""
 // ---------- preamble ----------
 
 func readBanner(c net.Conn) error {
-	// The handshake owns the deadline; do not clear it after the banner.
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	defer c.SetReadDeadline(time.Time{})
 	line := make([]byte, 0, 64)
 	b := make([]byte, 1)
 	for len(line) < 255 {
@@ -254,19 +252,7 @@ func sshBlob(alg string, n int) string {
 }
 
 func handshake(c net.Conn, psk string, isClient bool) (*secConn, error) {
-	return handshakeWithTimeout(c, psk, isClient, handshakeTimeout)
-}
-
-func handshakeWithTimeout(c net.Conn, psk string, isClient bool, timeout time.Duration) (_ *secConn, err error) {
-	stage := "banner"
-	defer func() {
-		if err != nil {
-			err = fmt.Errorf("handshake %s (%s -> %s): %w", stage, c.LocalAddr(), c.RemoteAddr(), err)
-		}
-	}()
-	if err := c.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return nil, err
-	}
+	c.SetDeadline(time.Now().Add(20 * time.Second))
 	defer c.SetDeadline(time.Time{})
 
 	my := make([]byte, 32) // first 16 bytes = salt, rest = filler
@@ -292,14 +278,12 @@ func handshakeWithTimeout(c net.Conn, psk string, isClient bool, timeout time.Du
 		if err := readBanner(c); err != nil {
 			return nil, err
 		}
-		stage = "KEXINIT"
 		if err := writeSSHPacket(c, buildKexInit(true)); err != nil {
 			return nil, err
 		}
 		if _, err := expect(20); err != nil {
 			return nil, err
 		}
-		stage = "ECDH"
 		if err := writeSSHPacket(c, append([]byte{30}, sshString(nil, string(my))...)); err != nil {
 			return nil, err
 		}
@@ -312,7 +296,6 @@ func handshakeWithTimeout(c net.Conn, psk string, isClient bool, timeout time.Du
 			return nil, errors.New("bad ECDH reply")
 		}
 		peer = strs[1]
-		stage = "NEWKEYS"
 		if err := writeSSHPacket(c, newkeys); err != nil {
 			return nil, err
 		}
@@ -326,14 +309,12 @@ func handshakeWithTimeout(c net.Conn, psk string, isClient bool, timeout time.Du
 		if _, err := c.Write([]byte(banner)); err != nil {
 			return nil, err
 		}
-		stage = "KEXINIT"
 		if _, err := expect(20); err != nil {
 			return nil, err
 		}
 		if err := writeSSHPacket(c, buildKexInit(false)); err != nil {
 			return nil, err
 		}
-		stage = "ECDH"
 		in, err := expect(30)
 		if err != nil {
 			return nil, err
@@ -350,7 +331,6 @@ func handshakeWithTimeout(c net.Conn, psk string, isClient bool, timeout time.Du
 		if err := writeSSHPacket(c, reply); err != nil {
 			return nil, err
 		}
-		stage = "NEWKEYS"
 		if _, err := expect(21); err != nil {
 			return nil, err
 		}
@@ -440,9 +420,6 @@ func yamuxCfg() *yamux.Config {
 	c.ConnectionWriteTimeout = 60 * time.Second // tolerate a congested link before giving up
 	c.MaxStreamWindowSize = uint32(windowKB) * 1024
 	c.LogOutput = io.Discard
-	if debugLogs {
-		c.LogOutput = os.Stderr
-	}
 	return c
 }
 
@@ -530,9 +507,6 @@ func (p *pool) pick(proto byte, port int) *yamux.Session {
 	defer p.mu.Unlock()
 	var cand []*member
 	for _, m := range p.s {
-		if m.sess.IsClosed() {
-			continue
-		}
 		set := m.tcp
 		if proto == protoUDP {
 			set = m.udp
@@ -544,8 +518,8 @@ func (p *pool) pick(proto byte, port int) *yamux.Session {
 	if len(cand) == 0 {
 		return nil
 	}
-	p.i = (p.i + 1) % len(cand)
-	return cand[p.i].sess
+	p.i++
+	return cand[p.i%len(cand)].sess
 }
 
 // hello (client -> server, first stream): [2B n][n x 2B tcp ports][2B m][m x 2B udp ports]
@@ -584,7 +558,6 @@ func handleTunnel(c net.Conn, psk string, p *pool) {
 	tune(c)
 	sc, err := handshake(c, psk, false)
 	if err != nil {
-		logOnce("server-handshake", "tunnel rejected: %v", err)
 		c.Close()
 		return
 	}
@@ -594,7 +567,6 @@ func handleTunnel(c net.Conn, psk string, p *pool) {
 		return
 	}
 	timer := time.AfterFunc(10*time.Second, func() { sess.Close() })
-	defer timer.Stop()
 	hs, err := sess.Accept()
 	if err != nil {
 		sess.Close()
@@ -821,19 +793,17 @@ func clientOnce(addr, psk string, allowed, allowedUDP map[int]bool) error {
 	if err != nil {
 		return err
 	}
-	defer c.Close()
 	tune(c)
 	sc, err := handshake(c, psk, true)
 	if err != nil {
+		c.Close()
 		return err
 	}
 	sess, err := yamux.Client(sc, yamuxCfg())
 	if err != nil {
+		c.Close()
 		return err
 	}
-	defer sess.Close()
-	helloTimer := time.AfterFunc(10*time.Second, func() { sess.Close() })
-	defer helloTimer.Stop()
 	hs, err := sess.Open()
 	if err != nil {
 		return err
@@ -842,21 +812,18 @@ func clientOnce(addr, psk string, allowed, allowedUDP map[int]bool) error {
 		return err
 	}
 	hs.Close()
-	helloTimer.Stop()
-	log.Printf("connected to %s (local %s)", addr, c.LocalAddr())
+	log.Printf("connected to %s", addr)
 	for {
 		st, err := sess.Accept()
 		if err != nil {
 			return err
 		}
 		go func() {
-			st.SetReadDeadline(time.Now().Add(10 * time.Second))
 			var hdr [3]byte
 			if _, err := io.ReadFull(st, hdr[:]); err != nil {
 				st.Close()
 				return
 			}
-			st.SetReadDeadline(time.Time{})
 			port := int(binary.BigEndian.Uint16(hdr[1:]))
 			if hdr[0] == protoUDP {
 				if !allowedUDP[port] {
@@ -912,9 +879,6 @@ func runClient(addr, psk string, ports, udpPorts []int, conns int) {
 					time.Sleep(backoff)
 					if backoff < 30*time.Second {
 						backoff *= 2
-						if backoff > 30*time.Second {
-							backoff = 30 * time.Second
-						}
 					}
 				}
 			}(target, i)
@@ -1239,8 +1203,6 @@ func main() {
 	conns := flag.Int("conns", 4, "client: number of parallel tunnel connections")
 	win := flag.Int("window", 1024, "per-stream window in KB (try 256 on slow/unstable links, up to 8192 on fast ones)")
 	windows := flag.String("windows", "256,1024,4096,8192", "tune modes: window sizes (KB) to try")
-	timeout := flag.Duration("handshake-timeout", 20*time.Second, "total handshake deadline (e.g. 20s)")
-	debug := flag.Bool("debug", false, "enable internal yamux diagnostics")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -1255,14 +1217,6 @@ func main() {
 	if *pad < 0 || *pad > 4096 {
 		log.Fatal("-pad must be 0..4096")
 	}
-	if *timeout <= 0 {
-		log.Fatal("-handshake-timeout must be positive")
-	}
-	if *mode == "client" && (*conns < 1 || *conns > 32) {
-		log.Fatal("-conns must be 1..32")
-	}
-	handshakeTimeout = *timeout
-	debugLogs = *debug
 	padMax = *pad
 	if *win < 256 || *win > 65536 {
 		log.Fatal("-window must be 256..65536 (KB)")

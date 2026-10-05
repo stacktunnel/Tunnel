@@ -149,6 +149,7 @@ Users connect to `INSIDE_IP:443` (TCP) or `INSIDE_IP:51820` (UDP) and reach `127
 | `-udp` | both | UDP ports/ranges |
 | `-pad` | both | Maximum random padding per frame in bytes (default `128`, `0` = off, max `4096`) |
 | `-conns` | client | Parallel tunnel connections per inside server (default `4`) |
+| `-rotate` | client | Proactively replace each tunnel connection on this jittered timer, e.g. `5m`, `3m` (default `5m`, `0` disables) |
 | `-bind` | server | IP the user-facing ports listen on (default: all interfaces) |
 | `-window` | both | Per-stream window in KB (default `1024`). Use `256` on slow or unstable links, larger values (up to `8192`) only on fast, high-latency links |
 
@@ -185,6 +186,16 @@ sudo bash setup.sh window 1024
 ```
 
 The test uses a separate port (default `4100`, open it on the inside server's firewall) and does not disturb the running tunnel. It measures the download direction (outside to inside) with 4 parallel streams.
+
+## Connection rotation
+
+Some paths throttle a single long-lived tunnel connection after roughly 10-20 minutes (the send window collapses and retransmits pile up), then it recovers if you reconnect. To avoid that, the client periodically opens a replacement connection and retires the old one gracefully — new streams go to the replacement, while any transfer already in progress on the old one is given up to 45 seconds to finish before it is closed.
+
+```bash
+./stacktunnel -mode client -key SECRET -tunnel INSIDE_IP:4000 -ports 443 -rotate 5m
+```
+
+Lower it (e.g. `-rotate 3m`) if you still see disconnects after a predictable number of minutes; `-rotate 0` disables rotation entirely. `setup.sh install` asks for this value on the outside server.
 
 ## Troubleshooting
 

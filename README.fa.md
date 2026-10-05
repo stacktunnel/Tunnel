@@ -49,7 +49,7 @@ sudo bash setup.sh status | logs | restart | update | show | uninstall
 sudo bash setup.sh update
 ```
 
-نسخه‌ها با هم **سازگار نیستند**: سرور ایران و خارج را با هم به‌روز کن.
+نسخه‌های patch در یک شاخهٔ minor از نظر پروتکل سازگارند؛ برای دریافت همهٔ اصلاحات هر دو سمت را به‌روز کن. قبل از تغییر minor فایل CHANGELOG.md را بخوان.
 
 ### اگر سروری به GitHub دسترسی ندارد
 
@@ -201,7 +201,7 @@ sudo bash setup.sh window 1024
 | `cannot connect to local service 127.0.0.1:P` (خارج) | سرویس واقعی اجرا نیست یا روی `127.0.0.1:P` گوش نمی‌دهد |
 | `request for tcp port P refused: not in this client's -ports` (خارج) | سرور ایران پورتی را ارائه می‌دهد که این سرور خارج برایش تنظیم نشده |
 
-این‌ها را هم چک کن: پورت تانل در سرور ایران باز باشد، **کلید یکسان** روی همه‌جا، و **نسخه‌ی یکسان** (نسخه‌ها با هم سازگار نیستند) روی همه‌ی سرورها.
+این‌ها را هم چک کن: پورت تانل در سرور ایران باز باشد، **کلید یکسان** روی همه‌جا، و **نسخه‌های سازگار** طبق CHANGELOG.md روی همه‌ی سرورها.
 
 ## تست سرعت
 
@@ -248,5 +248,18 @@ curl -o /dev/null -w "%{speed_download} bytes/s\n" http://127.0.0.1:8080/big.bin
 ## اعلان‌های متعلق به دیگران
 
 باینری‌ها شامل [hashicorp/yamux](https://github.com/hashicorp/yamux) (MPL-2.0)، [golang.org/x/crypto](https://pkg.go.dev/golang.org/x/crypto) و کتابخانه‌ی استاندارد Go (BSD-3-Clause) هستند. متن لایسنس آن‌ها در [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) است.
+
+## عیب‌یابی handshake
+
+پرچم `-handshake-timeout 20s` زمان کل handshake را محدود می‌کند.
+خطا نام مرحلهٔ `banner`، `KEXINIT`، `ECDH` یا `NEWKEYS` و آدرس دو طرف را نشان می‌دهد.
+پرچم `-debug` لاگ داخلی Yamux را فعال می‌کند. خطاهای handshake سمت سرور برای جلوگیری
+از ازدحام لاگ، در مجموع حداکثر یک بار در هر ۱۰ ثانیه چاپ می‌شوند.
+
+وضعیت TCP برابر `ESTAB` به معنی تکمیل handshake نیست. این اصلاح فقط زمان انتظار و
+بازیابی را اصلاح می‌کند و حذف بسته در شبکه را برطرف نمی‌کند. handshake ظاهری SSH
+این برنامه، SSH واقعی و سازگار با OpenSSH نیست.
+
+راهنمای نصب فایل ساخته‌شده: [UPDATE.fa.md](UPDATE.fa.md).
 
 </div>

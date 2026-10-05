@@ -416,7 +416,9 @@ func (s *secConn) Read(p []byte) (int, error) {
 
 func yamuxCfg() *yamux.Config {
 	c := yamux.DefaultConfig()
-	c.KeepAliveInterval = 15 * time.Second
+	// Jittered so many tunnel connections don't all ping at the same fixed
+	// period, which is itself a recognisable pattern.
+	c.KeepAliveInterval = 12*time.Second + time.Duration(mrand.Intn(8000))*time.Millisecond
 	c.ConnectionWriteTimeout = 60 * time.Second // tolerate a congested link before giving up
 	c.MaxStreamWindowSize = uint32(windowKB) * 1024
 	c.LogOutput = io.Discard
@@ -554,21 +556,62 @@ func readHello(r io.Reader) (tcp, udp map[int]bool, err error) {
 	return res[0], res[1], nil
 }
 
+func portSummary(set map[int]bool) string {
+	if len(set) == 0 {
+		return "none"
+	}
+	var l []int
+	for p := range set {
+		l = append(l, p)
+	}
+	sort.Ints(l)
+	var parts []string
+	for i, p := range l {
+		if i == 12 {
+			parts = append(parts, fmt.Sprintf("+%d more", len(l)-12))
+			break
+		}
+		parts = append(parts, strconv.Itoa(p))
+	}
+	return strings.Join(parts, ",")
+}
+
+// describe tells how many tunnels are connected and which TCP ports they announced.
+func (p *pool) describe() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.s) == 0 {
+		return "no tunnel is connected right now"
+	}
+	all := map[int]bool{}
+	for _, m := range p.s {
+		for port := range m.tcp {
+			all[port] = true
+		}
+	}
+	return fmt.Sprintf("%d tunnel(s) connected, announced tcp ports: %s", len(p.s), portSummary(all))
+}
+
 func handleTunnel(c net.Conn, psk string, p *pool) {
+	remote := c.RemoteAddr().String()
+	host, _, _ := net.SplitHostPort(remote)
 	tune(c)
 	sc, err := handshake(c, psk, false)
 	if err != nil {
+		logOnce("hs-"+host, "tunnel from %s: handshake failed: %v", remote, err)
 		c.Close()
 		return
 	}
 	sess, err := yamux.Server(sc, yamuxCfg())
 	if err != nil {
+		logOnce("ym-"+host, "tunnel from %s: cannot start session: %v", remote, err)
 		c.Close()
 		return
 	}
 	timer := time.AfterFunc(10*time.Second, func() { sess.Close() })
 	hs, err := sess.Accept()
 	if err != nil {
+		logOnce("hello-"+host, "tunnel from %s: no valid hello after the handshake (wrong key, or the connection was cut right after it): %v", remote, err)
 		sess.Close()
 		return
 	}
@@ -576,15 +619,17 @@ func handleTunnel(c net.Conn, psk string, p *pool) {
 	hs.Close()
 	timer.Stop()
 	if err != nil {
+		logOnce("hello-"+host, "tunnel from %s: bad hello: %v", remote, err)
 		sess.Close()
 		return
 	}
 	m := &member{sess: sess, tcp: tcp, udp: udp}
 	p.add(m)
-	log.Printf("tunnel up from %s: %d tcp / %d udp ports", c.RemoteAddr(), len(tcp), len(udp))
+	start := time.Now()
+	log.Printf("tunnel up from %s: %d tcp / %d udp ports (tcp: %s)", remote, len(tcp), len(udp), portSummary(tcp))
 	<-sess.CloseChan()
 	p.remove(m)
-	log.Printf("tunnel down from %s", c.RemoteAddr())
+	log.Printf("tunnel down from %s after %s", remote, time.Since(start).Round(time.Second))
 }
 
 func serveExposed(port int, p *pool) {
@@ -602,7 +647,7 @@ func serveExposed(port int, p *pool) {
 			tune(c)
 			sess := p.pick(protoTCP, port)
 			if sess == nil {
-				logOnce(fmt.Sprintf("notun-tcp-%d", port), "tcp :%d: connection from %s dropped, no kharej client has announced this port (is the client connected with -ports including %d?)", port, c.RemoteAddr(), port)
+				logOnce(fmt.Sprintf("notun-tcp-%d", port), "tcp :%d: connection from %s dropped: no connected client serves this port (%s). Check that the client is connected and its -ports includes %d", port, c.RemoteAddr(), p.describe(), port)
 				c.Close()
 				return
 			}
@@ -788,31 +833,40 @@ func handleUDPStream(st net.Conn, port int) {
 	}
 }
 
-func clientOnce(addr, psk string, allowed, allowedUDP map[int]bool) error {
+// connectSession dials, does the handshake and sends the hello. The session
+// is ready to Accept() streams but nothing is served yet.
+func connectSession(addr, psk string, allowed, allowedUDP map[int]bool) (*yamux.Session, error) {
 	c, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	tune(c)
 	sc, err := handshake(c, psk, true)
 	if err != nil {
 		c.Close()
-		return err
+		return nil, err
 	}
 	sess, err := yamux.Client(sc, yamuxCfg())
 	if err != nil {
 		c.Close()
-		return err
+		return nil, err
 	}
 	hs, err := sess.Open()
 	if err != nil {
-		return err
+		sess.Close()
+		return nil, err
 	}
 	if err := writeHello(hs, allowed, allowedUDP); err != nil {
-		return err
+		sess.Close()
+		return nil, err
 	}
 	hs.Close()
-	log.Printf("connected to %s", addr)
+	return sess, nil
+}
+
+// serveSession accepts streams until the session closes (by us, by the
+// peer, or by the network) and returns why.
+func serveSession(sess *yamux.Session, allowed, allowedUDP map[int]bool) error {
 	for {
 		st, err := sess.Accept()
 		if err != nil {
@@ -850,7 +904,68 @@ func clientOnce(addr, psk string, allowed, allowedUDP map[int]bool) error {
 	}
 }
 
-func runClient(addr, psk string, ports, udpPorts []int, conns int) {
+// retireSession stops the old session from taking new streams and closes it
+// once its existing streams have drained (or after a grace period).
+func retireSession(sess *yamux.Session, label string) {
+	_ = sess.GoAway() // best-effort: tell the peer we're retiring
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		if sess.NumStreams() == 0 {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	sess.Close()
+	log.Printf("%s: rotated out old connection (%d stream(s) still open at close)", label, sess.NumStreams())
+}
+
+// runClientSlot keeps one logical tunnel connection to addr alive. If rotate
+// is non-zero, the connection is proactively replaced every rotate (jittered
+// ±25%) by opening a fresh one and retiring the old one, so no single
+// connection lives long enough to accumulate whatever caused the slowdowns.
+func runClientSlot(addr, psk string, allowed, allowedUDP map[int]bool, idx int, rotate time.Duration) {
+	label := fmt.Sprintf("%s #%d", addr, idx)
+	backoff := time.Second
+	for {
+		start := time.Now()
+		sess, err := connectSession(addr, psk, allowed, allowedUDP)
+		if err != nil {
+			log.Printf("[%s] disconnected: %v", label, err)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = time.Second
+		log.Printf("connected to %s", addr)
+
+		var rotateAt <-chan time.Time
+		if rotate > 0 {
+			jitter := 0.75 + mrand.Float64()*0.5 // 0.75x .. 1.25x
+			rotateAt = time.After(time.Duration(float64(rotate) * jitter))
+		}
+		done := make(chan error, 1)
+		go func() { done <- serveSession(sess, allowed, allowedUDP) }()
+
+		select {
+		case err := <-done:
+			log.Printf("[%s] disconnected: %v", label, err)
+			if time.Since(start) < time.Minute {
+				time.Sleep(backoff)
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
+			}
+		case <-rotateAt:
+			go retireSession(sess, label) // old session keeps serving in-flight streams while it drains
+			// loop immediately to open the replacement; serveSession's
+			// goroutine above exits on its own once sess is closed.
+		}
+	}
+}
+
+func runClient(addr, psk string, ports, udpPorts []int, conns int, rotate time.Duration) {
 	allowed := map[int]bool{}
 	for _, p := range ports {
 		allowed[p] = true
@@ -868,19 +983,7 @@ func runClient(addr, psk string, ports, udpPorts []int, conns int) {
 		for i := 0; i < conns; i++ {
 			go func(target string, i int) {
 				time.Sleep(time.Duration(i) * 300 * time.Millisecond)
-				backoff := time.Second
-				for {
-					start := time.Now()
-					err := clientOnce(target, psk, allowed, allowedUDP)
-					log.Printf("[%s #%d] disconnected: %v", target, i, err)
-					if time.Since(start) > time.Minute {
-						backoff = time.Second
-					}
-					time.Sleep(backoff)
-					if backoff < 30*time.Second {
-						backoff *= 2
-					}
-				}
+				runClientSlot(target, psk, allowed, allowedUDP, i, rotate)
 			}(target, i)
 		}
 	}
@@ -1201,6 +1304,7 @@ func main() {
 	bind := flag.String("bind", "", "server: IP that user-facing ports listen on (default: all)")
 	pad := flag.Int("pad", 128, "max random padding bytes per frame (0 = off, max 4096)")
 	conns := flag.Int("conns", 4, "client: number of parallel tunnel connections")
+	rotate := flag.Duration("rotate", 5*time.Minute, "client: proactively replace each tunnel connection this often, jittered (0 = never rotate)")
 	win := flag.Int("window", 1024, "per-stream window in KB (try 256 on slow/unstable links, up to 8192 on fast ones)")
 	windows := flag.String("windows", "256,1024,4096,8192", "tune modes: window sizes (KB) to try")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -1232,7 +1336,7 @@ func main() {
 	case "server":
 		runServer(*tun, *key, parsePorts(*ports), parsePorts(*udp))
 	case "client":
-		runClient(*tun, *key, parsePorts(*ports), parsePorts(*udp), *conns)
+		runClient(*tun, *key, parsePorts(*ports), parsePorts(*udp), *conns, *rotate)
 	default:
 		flag.Usage()
 	}

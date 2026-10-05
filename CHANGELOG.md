@@ -5,6 +5,24 @@ a change in the **minor** number (`0.1.x` → `0.2.0`) may break compatibility b
 so update the inside and the outside server together. Patch releases (`0.1.0` → `0.1.1`) are
 compatible with each other.
 
+## [0.1.3]
+
+- Fix: on some paths a tunnel connection would be throttled hard (collapsed send window,
+  growing retransmit timeout) after roughly 10-16 minutes, then recover after reconnecting.
+  The client now proactively replaces each tunnel connection on a jittered timer before that
+  happens (`-rotate`, default `5m`, `0` disables), opening the replacement first and draining
+  the old one instead of cutting it, so in-flight transfers are not interrupted.
+- The yamux keepalive interval is now randomized per connection (12-20s) instead of a fixed
+  15s for every connection, which was itself a recognisable pattern. Wire-compatible with 0.1.x.
+  `setup.sh install` now asks for the rotation interval on the kharej side.
+
+## [0.1.2]
+
+- Clearer logs on the inside server: failed handshakes, wrong keys and silent connections are now
+  logged with the reason, `tunnel up` lists the announced ports, `tunnel down` shows how long the
+  tunnel lasted, and a dropped user connection says which tunnels and ports are currently connected.
+  Wire-compatible with 0.1.x.
+
 ## [0.1.1]
 
 - Fix: on slow or congested links the tunnel could stall for many seconds and drop connections

@@ -187,7 +187,7 @@ do_install() {
     systemctl stop "$SERVICE" 2>/dev/null || true
   fi
 
-  local key tun_port tcp_ports udp_ports pad conns iran_ip mode
+  local key tun_port tcp_ports udp_ports pad conns rotate iran_ip mode
 
   if [[ "$role" == 1 ]]; then
     mode="server"
@@ -236,6 +236,9 @@ do_install() {
     fi
     conns="$(ask "Parallel tunnel connections (4-8 for better speed)" 4)"
     [[ "$conns" =~ ^[0-9]+$ ]] && (( conns >= 1 && conns <= 32 )) || conns=4
+    rotate="$(ask "Proactively rotate each connection every (e.g. 5m, 3m, 0 to disable)" "5m")"
+    [[ "$rotate" =~ ^([0-9]+(s|m|h))$|^0$ ]] || rotate="5m"
+    [[ "$rotate" == "0" ]] && rotate="0s"
   fi
 
   pad="$(ask "Max random padding per frame in bytes (0 = off)" 128)"
@@ -283,7 +286,7 @@ do_install() {
       [[ "$e" == *:* ]] || e="${e}:${tun_port}"
       targets+="${targets:+,}${e}"
     done
-    args="-mode client -key ${key} -tunnel ${targets} -pad ${pad} -conns ${conns}"
+    args="-mode client -key ${key} -tunnel ${targets} -pad ${pad} -conns ${conns} -rotate ${rotate}"
   fi
   [[ -n "$tcp_ports" ]] && args+=" -ports ${tcp_ports}"
   [[ -n "$udp_ports" ]] && args+=" -udp ${udp_ports}"
@@ -300,6 +303,7 @@ TCP_PORTS=${tcp_ports}
 UDP_PORTS=${udp_ports}
 PAD=${pad}
 CONNS=${conns:-}
+ROTATE=${rotate:-}
 EOF
   chmod 600 "$CONF"
 

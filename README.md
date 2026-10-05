@@ -47,7 +47,7 @@ Make sure your real service on the outside server listens on `127.0.0.1` on the 
 sudo bash setup.sh update
 ```
 
-Releases are **not compatible with each other**: update the inside and the outside servers together.
+Patch releases in the same minor series are wire-compatible. Update both sides to receive all fixes; check CHANGELOG.md before changing minor versions.
 
 ### If a server cannot reach GitHub
 
@@ -199,7 +199,7 @@ Start with `sudo bash setup.sh logs`.
 | `cannot connect to local service 127.0.0.1:P` (outside) | Your real service is not running or not listening on `127.0.0.1:P` |
 | `request for tcp port P refused: not in this client's -ports` (outside) | The inside server offers a port this outside server was not configured for |
 
-Also check: tunnel port open on the inside server, the **same key** everywhere, and the **same release version** on every server (versions are not compatible with each other).
+Also check: tunnel port open on the inside server, the **same key** everywhere, and compatible versions on every server (see CHANGELOG.md).
 
 ## Speed test
 
@@ -246,3 +246,16 @@ For a commercial license, contact: _add your contact (e-mail or link) here_.
 ## Third-party notices
 
 The binaries include [hashicorp/yamux](https://github.com/hashicorp/yamux) (MPL-2.0), [golang.org/x/crypto](https://pkg.go.dev/golang.org/x/crypto) and the Go standard library (BSD-3-Clause). Their license texts are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Handshake diagnostics
+
+`-handshake-timeout 20s` bounds the entire handshake, including reads after the
+banner. Errors identify `banner`, `KEXINIT`, `ECDH`, or `NEWKEYS` and both socket
+addresses. `-debug` enables Yamux diagnostics on stderr. Server handshake errors
+are rate-limited to one message per 10 seconds across peers.
+
+A TCP `ESTAB` socket does not mean the tunnel handshake completed. A timeout fix
+lets the client retry sooner; it cannot restore packets discarded by the network.
+The SSH-shaped handshake is custom, not an interoperable SSH implementation.
+
+See [UPDATE.fa.md](UPDATE.fa.md) for installing a locally built fixed binary.

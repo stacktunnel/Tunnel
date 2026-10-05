@@ -45,6 +45,12 @@ jobs:
           fi
           go mod tidy
 
+      - name: Test before release
+        run: |
+          go test -race ./...
+          go vet ./...
+          bash -n setup.sh
+
       - name: Build all targets
         run: |
           mkdir dist

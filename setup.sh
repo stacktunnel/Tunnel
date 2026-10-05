@@ -404,7 +404,7 @@ do_status() {
 
 do_update() {
   if [[ ! -f "$UNIT" ]]; then err "Service is not installed. Run: sudo bash $0 install"; return 1; fi
-  warn "Versions are not compatible with each other: update the inside AND outside servers."
+  warn "Check CHANGELOG.md for compatibility. Update both sides to receive all fixes."
   local before; before="$("$BIN" -version 2>/dev/null || echo unknown)"
   install_binary force || return 1
   systemctl restart "$SERVICE" && ok "Updated: ${before}  ->  $("$BIN" -version 2>/dev/null || echo unknown). Service restarted."

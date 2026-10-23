@@ -53,7 +53,7 @@ jobs:
 
           build() {
             local goos="$1" goarch="$2" goarm="${3:-}" ext="${4:-}"
-            local name="stacktunnel-${TAG}-${goos}-${goarch}${goarm:+v$goarm}"
+            local name="stacktunnel-${goos}-${goarch}${goarm:+v$goarm}"
             local out="dist/${name}${ext}"
             echo "Building ${out}"
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" \

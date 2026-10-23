@@ -38,7 +38,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Deliberately NOT go-version-file: go.mod. go.mod's "go 1.18" is a
+          # floor for building from source on old servers (apt's golang-go on
+          # Ubuntu 22.04 is 1.18), not a ceiling for this CI build - using a
+          # modern toolchain here lets go mod tidy pick current dependency
+          # versions (which themselves require newer stdlib packages such as
+          # crypto/ecdh) without that floor getting in the way.
+          go-version: "1.23"
 
       - name: Resolve modules
         run: go mod tidy

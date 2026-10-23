@@ -155,6 +155,8 @@ Users connect to `INSIDE_IP:443` (TCP) or `INSIDE_IP:51820` (UDP) and reach `127
 | `-junk` | both | Send a decoy frame on this jittered interval, e.g. `20s` (default `0`, off) |
 | `-bind` | server | IP the user-facing ports listen on (default: all interfaces) |
 | `-window` | both | Per-stream window in KB (default `1024`). Use `256` on slow or unstable links, larger values (up to `8192`) only on fast, high-latency links |
+| `-transport` | both | Tunnel transport: `tcp` (default) or `udp`. Must match on both sides |
+| `-fec-data` / `-fec-parity` | both | `-transport udp` only: forward-error-correction shard counts (default `10`/`3`, parity `0` disables FEC) |
 
 ### Several servers
 
@@ -208,6 +210,10 @@ Two settings add noise to the traffic's shape, independent of the padding and en
 - **`-junk 20s`** (off by default) sends a content-free decoy frame on a jittered timer. The receiving side already discards any frame with no real content, so turning this on needs no change on the other end, though the other end can enable its own `-junk` independently for traffic in both directions.
 
 Neither is a proven defense against a specific filter; both only add noise to the shape of the traffic.
+
+## Transport: TCP vs UDP
+
+By default the tunnel connection is TCP. Add `-transport udp` on **both** sides to use the UDP transport instead - a completely different wire shape, useful if you want the tunnel connections spread across both protocols rather than all looking the same. The two transports are not compatible with each other: every server and client in a given tunnel must use the same `-transport` value. `-source-ips` and `-rotate` both work the same way under either transport.
 
 ## Troubleshooting
 

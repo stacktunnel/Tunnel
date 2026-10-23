@@ -76,6 +76,32 @@ func logOnce(key, format string, a ...interface{}) {
 // address the user-facing ports bind to on the server ("" = all interfaces)
 var bindAddr = ""
 
+// fragmentEnabled randomizes frame boundaries instead of always filling to
+// maxPlain (see secConn.Write). junkInterval, if > 0, makes both sides send
+// a decoy frame on an idle-friendly jittered timer (see junkLoop).
+var fragmentEnabled = true
+var junkInterval time.Duration
+
+// junkLoop sends decoy frames on sc until stop closes. Disabled if
+// junkInterval <= 0. Meant to be started once per tunnel connection
+// (tied to that connection's lifetime), not per logical stream.
+func junkLoop(sc *secConn, stop <-chan struct{}) {
+	if junkInterval <= 0 {
+		return
+	}
+	for {
+		jitter := time.Duration(float64(junkInterval) * (0.5 + mrand.Float64()))
+		select {
+		case <-stop:
+			return
+		case <-time.After(jitter):
+			if sc.writeJunk() != nil {
+				return
+			}
+		}
+	}
+}
+
 // ---------- preamble ----------
 
 func readBanner(c net.Conn) error {
@@ -347,33 +373,59 @@ func handshake(c net.Conn, psk string, isClient bool) (*secConn, error) {
 	}, nil
 }
 
+// sealChunk encrypts and sends one frame carrying up to maxPlain bytes of
+// real data (chunk may be nil/empty: that produces a content-free "junk"
+// frame, since the receiver silently skips any frame whose real length is 0).
+// Caller must hold s.wmu.
+func (s *secConn) sealChunk(chunk []byte) error {
+	n := len(chunk)
+	// plaintext = [2B real length][data][random-length zero padding]
+	pad := 0
+	if padMax > 0 {
+		pad = mrand.Intn(padMax + 1)
+		if n < 128 { // small frames (acks, headers, junk) get extra variance
+			pad += mrand.Intn(129)
+		}
+	}
+	plain := make([]byte, 2+n+pad)
+	binary.BigEndian.PutUint16(plain, uint16(n))
+	copy(plain[2:], chunk)
+	rand.Read(plain[2+n:]) // random padding bytes, not zero, so junk is indistinguishable from real ciphertext
+	var hdr [2]byte
+	binary.BigEndian.PutUint16(hdr[:], uint16(len(plain)+overhead)^lenMask(s.wlk, s.wn))
+	frame := make([]byte, 0, 2+len(plain)+overhead)
+	frame = append(frame, hdr[:]...)
+	frame = s.wa.Seal(frame, nonce(s.wn), plain, hdr[:])
+	s.wn++
+	_, err := s.Conn.Write(frame)
+	return err
+}
+
+// writeJunk sends one decoy frame with no real payload, to add timing/size
+// noise independent of actual application traffic (e.g. during idle periods).
+func (s *secConn) writeJunk() error {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	return s.sealChunk(nil) // real length 0; sealChunk's own padding supplies the decoy bytes
+}
+
 func (s *secConn) Write(p []byte) (int, error) {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 	total := 0
 	for len(p) > 0 {
-		n := len(p)
-		if n > maxPlain {
-			n = maxPlain
+		upper := len(p)
+		if upper > maxPlain {
+			upper = maxPlain
 		}
-		// plaintext = [2B real length][data][random-length zero padding]
-		pad := 0
-		if padMax > 0 {
-			pad = mrand.Intn(padMax + 1)
-			if n < 128 { // small frames (acks, headers) get extra variance
-				pad += mrand.Intn(129)
-			}
+		n := upper
+		if fragmentEnabled && upper > 256 {
+			// Randomize frame boundaries instead of always filling to maxPlain,
+			// so frame sizes don't reveal the shape of the application's writes.
+			lo := 256
+			n = lo + mrand.Intn(upper-lo+1)
 		}
-		plain := make([]byte, 2+n+pad)
-		binary.BigEndian.PutUint16(plain, uint16(n))
-		copy(plain[2:], p[:n])
-		var hdr [2]byte
-		binary.BigEndian.PutUint16(hdr[:], uint16(len(plain)+overhead)^lenMask(s.wlk, s.wn))
-		frame := make([]byte, 0, 2+len(plain)+overhead)
-		frame = append(frame, hdr[:]...)
-		frame = s.wa.Seal(frame, nonce(s.wn), plain, hdr[:])
-		s.wn++
-		if _, err := s.Conn.Write(frame); err != nil {
+		if err := s.sealChunk(p[:n]); err != nil {
 			return total, err
 		}
 		total += n
@@ -627,6 +679,7 @@ func handleTunnel(c net.Conn, psk string, p *pool) {
 	p.add(m)
 	start := time.Now()
 	log.Printf("tunnel up from %s: %d tcp / %d udp ports (tcp: %s)", remote, len(tcp), len(udp), portSummary(tcp))
+	go junkLoop(sc, sess.CloseChan())
 	<-sess.CloseChan()
 	p.remove(m)
 	log.Printf("tunnel down from %s after %s", remote, time.Since(start).Round(time.Second))
@@ -835,8 +888,24 @@ func handleUDPStream(st net.Conn, port int) {
 
 // connectSession dials, does the handshake and sends the hello. The session
 // is ready to Accept() streams but nothing is served yet.
+// sourceIPs, if non-empty, is the set of local IPs the client rotates
+// through when opening a new tunnel connection (one per outgoing dial),
+// so aggregate egress volume is spread across several source addresses on
+// the same machine instead of coming from a single IP.
+var sourceIPs []net.IP
+var sourceIdx int32
+
+func dialWithSource(addr string) (net.Conn, error) {
+	if len(sourceIPs) == 0 {
+		return net.DialTimeout("tcp", addr, 10*time.Second)
+	}
+	i := int(atomic.AddInt32(&sourceIdx, 1)-1) % len(sourceIPs)
+	d := net.Dialer{Timeout: 10 * time.Second, LocalAddr: &net.TCPAddr{IP: sourceIPs[i]}}
+	return d.Dial("tcp", addr)
+}
+
 func connectSession(addr, psk string, allowed, allowedUDP map[int]bool) (*yamux.Session, error) {
-	c, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	c, err := dialWithSource(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -861,6 +930,7 @@ func connectSession(addr, psk string, allowed, allowedUDP map[int]bool) (*yamux.
 		return nil, err
 	}
 	hs.Close()
+	go junkLoop(sc, sess.CloseChan())
 	return sess, nil
 }
 
@@ -1305,6 +1375,9 @@ func main() {
 	pad := flag.Int("pad", 128, "max random padding bytes per frame (0 = off, max 4096)")
 	conns := flag.Int("conns", 4, "client: number of parallel tunnel connections")
 	rotate := flag.Duration("rotate", 5*time.Minute, "client: proactively replace each tunnel connection this often, jittered (0 = never rotate)")
+	srcIPs := flag.String("source-ips", "", "client: comma separated local IPs to rotate through when dialing out (must already be assigned to a network interface on this machine)")
+	fragment := flag.Bool("fragment", true, "randomize frame boundaries instead of always filling frames to the maximum size")
+	junk := flag.Duration("junk", 0, "send a decoy frame on this jittered interval to add timing/size noise, e.g. 20s (0 = off)")
 	win := flag.Int("window", 1024, "per-stream window in KB (try 256 on slow/unstable links, up to 8192 on fast ones)")
 	windows := flag.String("windows", "256,1024,4096,8192", "tune modes: window sizes (KB) to try")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -1326,6 +1399,18 @@ func main() {
 		log.Fatal("-window must be 256..65536 (KB)")
 	}
 	windowKB = *win
+	fragmentEnabled = *fragment
+	junkInterval = *junk
+	if *srcIPs != "" {
+		for _, s := range strings.Split(*srcIPs, ",") {
+			s = strings.TrimSpace(s)
+			ip := net.ParseIP(s)
+			if ip == nil {
+				log.Fatalf("-source-ips: %q is not a valid IP", s)
+			}
+			sourceIPs = append(sourceIPs, ip)
+		}
+	}
 	bindAddr = *bind
 	log.Printf("stacktunnel %s starting (%s)", version, *mode)
 	switch *mode {

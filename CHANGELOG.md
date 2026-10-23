@@ -5,6 +5,18 @@ a change in the **minor** number (`0.1.x` → `0.2.0`) may break compatibility b
 so update the inside and the outside server together. Patch releases (`0.1.0` → `0.1.1`) are
 compatible with each other.
 
+## [0.1.4]
+
+- Added frame-size randomization (`-fragment`, on by default): instead of always filling a frame
+  to the maximum size, each frame's length is picked randomly, so application write boundaries
+  are no longer visible as fixed-size frames on the wire.
+- Added decoy frames (`-junk DURATION`, e.g. `-junk 20s`, default off): both sides can send
+  content-free frames on a jittered timer to add timing/size noise independent of real traffic.
+  The receiver already silently discards any frame with zero real length, so this needed no
+  protocol change. Wire-compatible with 0.1.x (older binaries simply never see junk frames
+  from a newer peer unless the newer peer has `-junk` set, and always tolerate them either way).
+- Added IPv6-aware source-IP rotation (`-source-ips`), from the previous working session.
+
 ## [0.1.3]
 
 - Fix: on some paths a tunnel connection would be throttled hard (collapsed send window,

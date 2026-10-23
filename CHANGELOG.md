@@ -5,6 +5,20 @@ a change in the **minor** number (`0.1.x` → `0.2.0`) may break compatibility b
 so update the inside and the outside server together. Patch releases (`0.1.0` → `0.1.1`) are
 compatible with each other.
 
+## [0.2.0]
+
+- Replaced the handshake's key agreement with a real X25519 ECDH exchange.
+  Previously, session keys were derived from the pre-shared key and two
+  random values alone, with no actual Diffie-Hellman step, so a leaked PSK
+  could retroactively decrypt any captured traffic. Each connection now
+  generates a fresh ephemeral X25519 keypair, performs a real ECDH, and
+  derives keys from PSK + the ECDH shared secret + both public keys, giving
+  genuine forward secrecy: a leaked PSK no longer exposes past sessions.
+  The wire format is unchanged (same 32-byte field inside the fake SSH
+  KEX_ECDH_INIT/REPLY messages), but the derived keys differ, so this is
+  **not wire-compatible with 0.1.x** - update both the inside and outside
+  server at the same time.
+
 ## [0.1.4]
 
 - Added frame-size randomization (`-fragment`, on by default): instead of always filling a frame

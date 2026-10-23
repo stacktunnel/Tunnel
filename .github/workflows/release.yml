@@ -40,6 +40,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Resolve modules
+        run: go mod tidy
+
       - name: Download modules
         run: go mod download
 

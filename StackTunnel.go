@@ -2,8 +2,8 @@
 // First packet is an SSH-2.0 banner sent alone; afterwards everything is
 // AEAD-encrypted and multiplexed with yamux.
 //
-//   Iran:   ./tunnel -mode server -key SECRET -tunnel :4000 -ports 443 -udp 51820 -pad 128
-//   Kharej: ./tunnel -mode client -key SECRET -tunnel IRAN_IP:4000 -ports 443 -udp 51820 -pad 128 -conns 4
+//	Iran:   ./tunnel -mode server -key SECRET -tunnel :4000 -ports 443 -udp 51820 -pad 128
+//	Kharej: ./tunnel -mode client -key SECRET -tunnel IRAN_IP:4000 -ports 443 -udp 51820 -pad 128 -conns 4
 //
 // Users connect to Iran:443 (tcp) / Iran:51820 (udp) -> through the tunnel ->
 // kharej 127.0.0.1:443 / 127.0.0.1:51820.
@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/yamux"
+	kcp "github.com/xtaci/kcp-go/v5"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 )
@@ -883,6 +884,10 @@ func runServer(addr, psk string, ports, udpPorts []int) {
 	for _, port := range udpPorts {
 		go serveUDP(port, p)
 	}
+	if transport == "udp" {
+		runServerKCP(addr, psk, p)
+		return
+	}
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatal(err)
@@ -948,8 +953,111 @@ func dialWithSource(addr string) (net.Conn, error) {
 	return d.Dial("tcp", addr)
 }
 
+// ---------- UDP+KCP+FEC transport ----------
+//
+// An alternative to the TCP+fake-SSH transport, selected with -transport udp.
+// The wire shape is completely different: one raw STUN Binding Request
+// datagram goes out first (the magic cookie satisfies the filter's "looks
+// like STUN" exemption for UDP), then every further datagram is a KCP+FEC
+// frame on the same local port. Everything above the transport - the
+// handshake, the AEAD framing, yamux - is unchanged: kcp.UDPSession
+// satisfies net.Conn, so it plugs into the exact same handshake()/secConn/
+// yamux pipeline the TCP transport uses.
+
+var fecData, fecParity = 10, 3
+
+// stunProbe builds a minimal RFC 5389 STUN Binding Request: just enough
+// (message type + zero length + the magic cookie + a random transaction id)
+// for a filter matching on the magic cookie alone; it is never meant to be
+// parsed as a real STUN exchange, only sent once as the first datagram on a
+// connection so the flow is classified as STUN before any KCP traffic.
+func stunProbe() []byte {
+	b := make([]byte, 20)
+	binary.BigEndian.PutUint16(b[0:2], 0x0001)     // Binding Request
+	binary.BigEndian.PutUint16(b[2:4], 0x0000)     // no attributes
+	binary.BigEndian.PutUint32(b[4:8], 0x2112A442) // magic cookie
+	rand.Read(b[8:20])                             // transaction id
+	return b
+}
+
+func tuneKCP(s *kcp.UDPSession) {
+	s.SetStreamMode(true) // behave like a byte stream, as yamux/secConn expect
+	s.SetWindowSize(256, 256)
+	s.SetNoDelay(1, 10, 2, 1) // turbo mode: low latency over raw throughput
+	s.SetACKNoDelay(true)
+}
+
+// dialKCP opens a UDP socket (optionally bound to a rotating source IP, same
+// as the TCP transport's -source-ips), sends the raw STUN probe on it, then
+// hands that same socket to KCP for the real tunnel traffic.
+func dialKCP(addr string) (net.Conn, error) {
+	raddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	var laddr *net.UDPAddr
+	if len(sourceIPs) > 0 {
+		i := int(atomic.AddInt32(&sourceIdx, 1)-1) % len(sourceIPs)
+		laddr = &net.UDPAddr{IP: sourceIPs[i]}
+	}
+	pc, err := net.ListenUDP("udp", laddr)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := pc.WriteTo(stunProbe(), raddr); err != nil {
+		pc.Close()
+		return nil, err
+	}
+	sess, err := kcp.NewConn2(raddr, nil, fecData, fecParity, pc)
+	if err != nil {
+		pc.Close()
+		return nil, err
+	}
+	tuneKCP(sess)
+	return sess, nil
+}
+
+// runServerKCP is the UDP+KCP counterpart of runServer's TCP accept loop.
+// The lone raw STUN probe each client sends before its first KCP packet is
+// read and silently dropped by the KCP engine as an unparseable frame; real
+// KCP traffic from that same address is then accepted as a new session.
+func runServerKCP(addr, psk string, p *pool) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	pc, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ln, err := kcp.ServeConn(nil, fecData, fecParity, pc)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("waiting for tunnel (udp+kcp) on %s", addr)
+	for {
+		sess, err := ln.AcceptKCP()
+		if err != nil {
+			continue
+		}
+		tuneKCP(sess)
+		go handleTunnel(sess, psk, p)
+	}
+}
+
+// transport selects the tunnel connection's wire transport: "tcp" (default,
+// the fake-SSH banner over TCP) or "udp" (STUN probe + KCP+FEC).
+var transport = "tcp"
+
+func dialTunnel(addr string) (net.Conn, error) {
+	if transport == "udp" {
+		return dialKCP(addr)
+	}
+	return dialWithSource(addr)
+}
+
 func connectSession(addr, psk string, allowed, allowedUDP map[int]bool) (*yamux.Session, error) {
-	c, err := dialWithSource(addr)
+	c, err := dialTunnel(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -1424,6 +1532,9 @@ func main() {
 	junk := flag.Duration("junk", 0, "send a decoy frame on this jittered interval to add timing/size noise, e.g. 20s (0 = off)")
 	win := flag.Int("window", 1024, "per-stream window in KB (try 256 on slow/unstable links, up to 8192 on fast ones)")
 	windows := flag.String("windows", "256,1024,4096,8192", "tune modes: window sizes (KB) to try")
+	trans := flag.String("transport", "tcp", "tunnel transport: tcp (fake-SSH banner) or udp (STUN probe + KCP+FEC)")
+	fecD := flag.Int("fec-data", 10, "transport=udp: number of data shards per FEC group")
+	fecP := flag.Int("fec-parity", 3, "transport=udp: number of parity shards per FEC group (0 disables FEC)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -1456,6 +1567,14 @@ func main() {
 		}
 	}
 	bindAddr = *bind
+	if *trans != "tcp" && *trans != "udp" {
+		log.Fatal("-transport must be tcp or udp")
+	}
+	transport = *trans
+	if *fecD < 0 || *fecP < 0 {
+		log.Fatal("-fec-data and -fec-parity must be >= 0")
+	}
+	fecData, fecParity = *fecD, *fecP
 	log.Printf("stacktunnel %s starting (%s)", version, *mode)
 	switch *mode {
 	case "tune-server":

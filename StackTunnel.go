@@ -32,6 +32,7 @@ import (
 
 	"github.com/hashicorp/yamux"
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/curve25519"
 )
 
 const (
@@ -177,11 +178,17 @@ func lenMask(key []byte, n uint64) uint16 {
 	return binary.BigEndian.Uint16(h.Sum(nil))
 }
 
-// ---------- fake SSH handshake ----------
+// ---------- fake SSH handshake, real ECDH ----------
 //
 // banner -> KEXINIT -> KEX_ECDH_INIT / KEX_ECDH_REPLY -> NEWKEYS
-// All packets use the real SSH binary packet format. The "ephemeral key"
-// field carries our random salt; after NEWKEYS everything is our own
+// All packets use the real SSH binary packet format, which is what makes the
+// opener classify as SSH. The "ephemeral key" field carries a genuine X25519
+// public key: both sides generate a fresh ephemeral keypair per connection,
+// exchange public keys inside those fields, and compute a real ECDH shared
+// secret. Session keys are derived from PSK + that shared secret + both
+// public keys, so a session's keys cannot be reconstructed from the PSK
+// alone even if the PSK and the full packet capture are both later
+// compromised (forward secrecy). After NEWKEYS everything is our own
 // encrypted framing (which, like real SSH, looks like random bytes).
 
 func sshString(b []byte, s string) []byte {
@@ -277,12 +284,33 @@ func sshBlob(alg string, n int) string {
 	return string(b)
 }
 
+// ecdhSalt derives a direction-specific salt from the completed ECDH, bound
+// to both parties' public keys and a direction label so the client->server
+// and server->client keys are independent even though both sides computed
+// the same raw shared secret.
+func ecdhSalt(label string, shared, clientPub, serverPub []byte) []byte {
+	h := sha256.New()
+	h.Write([]byte("tunnel-ecdh-v1:" + label))
+	h.Write(shared)
+	h.Write(clientPub)
+	h.Write(serverPub)
+	return h.Sum(nil)
+}
+
 func handshake(c net.Conn, psk string, isClient bool) (*secConn, error) {
 	c.SetDeadline(time.Now().Add(20 * time.Second))
 	defer c.SetDeadline(time.Time{})
 
-	my := make([]byte, 32) // first 16 bytes = salt, rest = filler
-	rand.Read(my)
+	// Fresh ephemeral X25519 keypair for this connection only. X25519
+	// clamps the scalar internally, so 32 random bytes are a valid
+	// private key as-is.
+	ephPriv := make([]byte, 32)
+	rand.Read(ephPriv)
+	ephPub, err := curve25519.X25519(ephPriv, curve25519.Basepoint)
+	if err != nil {
+		return nil, fmt.Errorf("ephemeral keygen: %w", err)
+	}
+
 	expect := func(code byte) ([]byte, error) {
 		p, err := readSSHPacket(c)
 		if err != nil {
@@ -294,7 +322,7 @@ func handshake(c net.Conn, psk string, isClient bool) (*secConn, error) {
 		return p, nil
 	}
 	newkeys := []byte{21}
-	var peer []byte
+	var clientPub, serverPub []byte
 
 	if isClient {
 		// The banner goes out alone as the very first data segment.
@@ -310,7 +338,7 @@ func handshake(c net.Conn, psk string, isClient bool) (*secConn, error) {
 		if _, err := expect(20); err != nil {
 			return nil, err
 		}
-		if err := writeSSHPacket(c, append([]byte{30}, sshString(nil, string(my))...)); err != nil {
+		if err := writeSSHPacket(c, append([]byte{30}, sshString(nil, string(ephPub))...)); err != nil {
 			return nil, err
 		}
 		rep, err := expect(31)
@@ -321,7 +349,7 @@ func handshake(c net.Conn, psk string, isClient bool) (*secConn, error) {
 		if err != nil || len(strs) < 2 || len(strs[1]) != 32 {
 			return nil, errors.New("bad ECDH reply")
 		}
-		peer = strs[1]
+		clientPub, serverPub = ephPub, strs[1]
 		if err := writeSSHPacket(c, newkeys); err != nil {
 			return nil, err
 		}
@@ -349,10 +377,10 @@ func handshake(c net.Conn, psk string, isClient bool) (*secConn, error) {
 		if err != nil || len(strs) < 1 || len(strs[0]) != 32 {
 			return nil, errors.New("bad ECDH init")
 		}
-		peer = strs[0]
+		clientPub, serverPub = strs[0], ephPub
 		reply := []byte{31}
 		reply = sshString(reply, sshBlob("ssh-ed25519", 32))
-		reply = sshString(reply, string(my))
+		reply = sshString(reply, string(ephPub))
 		reply = sshString(reply, sshBlob("ssh-ed25519", 64))
 		if err := writeSSHPacket(c, reply); err != nil {
 			return nil, err
@@ -365,7 +393,23 @@ func handshake(c net.Conn, psk string, isClient bool) (*secConn, error) {
 		}
 	}
 
-	sendSalt, recvSalt := my[:16], peer[:16]
+	peerPub := serverPub
+	if !isClient {
+		peerPub = clientPub
+	}
+	shared, err := curve25519.X25519(ephPriv, peerPub)
+	if err != nil {
+		// A malformed or low-order peer public key: never happens against
+		// our own binary, but must not be trusted blindly either way.
+		return nil, fmt.Errorf("ecdh: %w", err)
+	}
+
+	saltC2S := ecdhSalt("c2s", shared, clientPub, serverPub)
+	saltS2C := ecdhSalt("s2c", shared, clientPub, serverPub)
+	sendSalt, recvSalt := saltS2C, saltC2S
+	if isClient {
+		sendSalt, recvSalt = saltC2S, saltS2C
+	}
 	return &secConn{
 		Conn: c,
 		wa:   derive(psk, sendSalt), ra: derive(psk, recvSalt),

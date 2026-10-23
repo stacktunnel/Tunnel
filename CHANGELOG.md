@@ -5,6 +5,30 @@ a change in the **minor** number (`0.1.x` → `0.2.0`) may break compatibility b
 so update the inside and the outside server together. Patch releases (`0.1.0` → `0.1.1`) are
 compatible with each other.
 
+## [0.2.2]
+
+- Fixed: the UDP transport's KCP layer was sending its own packet header
+  (connection id, serial numbers, timestamps) in clear. That header is a
+  well-known, publicly documented byte pattern on its own - some DPI
+  systems match raw KCP traffic by it regardless of what is encrypted
+  inside. Every KCP packet is now itself encrypted with a key derived from
+  the pre-shared key, so the header is no longer visible on the wire. This
+  is on top of, not instead of, the existing per-connection encryption of
+  the actual tunnel data. **Not wire-compatible with 0.2.1's UDP transport**
+  (TCP transport is unaffected) - update both sides together if you use
+  `-transport udp`.
+
+## [0.2.1]
+
+- Added a second transport, `-transport udp` (default stays `tcp`): instead
+  of the fake SSH banner over TCP, the client sends one raw STUN Binding
+  Request datagram first (satisfying the filter's UDP exemption), then all
+  further traffic is KCP with Reed-Solomon forward error correction
+  (`-fec-data`/`-fec-parity`) on the same local port. Everything above the
+  transport - the handshake, encryption, yamux multiplexing, rotation,
+  source-IP rotation - is unchanged and works the same way under either
+  transport. Both sides must use the same `-transport` value.
+
 ## [0.2.0]
 
 - Replaced the handshake's key agreement with a real X25519 ECDH exchange.

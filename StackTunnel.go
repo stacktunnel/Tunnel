@@ -987,10 +987,35 @@ func tuneKCP(s *kcp.UDPSession) {
 	s.SetACKNoDelay(true)
 }
 
+// kcpBlock derives a static AES-256 key from the PSK and returns a KCP
+// BlockCrypt that encrypts entire KCP packets - header included - before
+// they go on the wire. Without this, KCP's own packet header (conv id,
+// command, serial number, window, timestamp) is sent in clear and is a
+// well-known, publicly documented byte pattern on its own, regardless of
+// what is encrypted inside the payload; several DPI systems have rules
+// that match raw KCP traffic by that header shape alone. This is a
+// separate, static layer from the per-connection ephemeral keys the
+// handshake negotiates for the actual tunnel data (derive/ecdhSalt) - it
+// exists purely to keep the transport's own envelope from being
+// recognizable, not to replace the real encryption inside it.
+func kcpBlock(psk string) kcp.BlockCrypt {
+	h := sha256.New()
+	h.Write([]byte("tunnel-kcp-v1"))
+	h.Write([]byte(psk))
+	block, err := kcp.NewAESBlockCrypt(h.Sum(nil))
+	if err != nil {
+		// Should never happen with a fixed 32-byte key; fall back to no
+		// KCP-level encryption rather than fail the connection outright -
+		// the handshake/secConn layer above still protects the real data.
+		return nil
+	}
+	return block
+}
+
 // dialKCP opens a UDP socket (optionally bound to a rotating source IP, same
 // as the TCP transport's -source-ips), sends the raw STUN probe on it, then
 // hands that same socket to KCP for the real tunnel traffic.
-func dialKCP(addr string) (net.Conn, error) {
+func dialKCP(addr, psk string) (net.Conn, error) {
 	raddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
@@ -1008,7 +1033,7 @@ func dialKCP(addr string) (net.Conn, error) {
 		pc.Close()
 		return nil, err
 	}
-	sess, err := kcp.NewConn2(raddr, nil, fecData, fecParity, pc)
+	sess, err := kcp.NewConn2(raddr, kcpBlock(psk), fecData, fecParity, pc)
 	if err != nil {
 		pc.Close()
 		return nil, err
@@ -1030,7 +1055,7 @@ func runServerKCP(addr, psk string, p *pool) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	ln, err := kcp.ServeConn(nil, fecData, fecParity, pc)
+	ln, err := kcp.ServeConn(kcpBlock(psk), fecData, fecParity, pc)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1049,15 +1074,15 @@ func runServerKCP(addr, psk string, p *pool) {
 // the fake-SSH banner over TCP) or "udp" (STUN probe + KCP+FEC).
 var transport = "tcp"
 
-func dialTunnel(addr string) (net.Conn, error) {
+func dialTunnel(addr, psk string) (net.Conn, error) {
 	if transport == "udp" {
-		return dialKCP(addr)
+		return dialKCP(addr, psk)
 	}
 	return dialWithSource(addr)
 }
 
 func connectSession(addr, psk string, allowed, allowedUDP map[int]bool) (*yamux.Session, error) {
-	c, err := dialTunnel(addr)
+	c, err := dialTunnel(addr, psk)
 	if err != nil {
 		return nil, err
 	}

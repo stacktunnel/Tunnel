@@ -574,7 +574,18 @@ func parsePorts(s string) []int {
 type member struct {
 	sess     *yamux.Session
 	tcp, udp map[int]bool
+	// fails is a lightweight health signal: incremented every time opening
+	// or writing to a stream through this member fails, reset to 0 on the
+	// next success. pick() prefers members with the lowest fail count
+	// instead of a blind round-robin, so a degraded tunnel (packet loss,
+	// a half-dead path) gets steered away from without being dropped from
+	// the pool outright - it keeps getting picked again once it's healthy,
+	// or once every other member is equally unhealthy.
+	fails int32
 }
+
+func (m *member) ok()   { atomic.StoreInt32(&m.fails, 0) }
+func (m *member) fail() { atomic.AddInt32(&m.fails, 1) }
 
 type pool struct {
 	mu sync.Mutex
@@ -599,18 +610,31 @@ func (p *pool) remove(m *member) {
 	p.mu.Unlock()
 }
 
-// pick returns a tunnel connection whose client serves this port
-// (round-robin between all clients that announced it).
-func (p *pool) pick(proto byte, port int) *yamux.Session {
+// pick returns a member whose client serves this port, round-robin among
+// whichever of them currently have the lowest fail count (see member.fails).
+// A perfectly healthy pool behaves exactly like plain round-robin, since
+// every candidate ties at 0; a member accumulating failures is passed over
+// in favor of its healthier siblings without ever being fully excluded.
+func (p *pool) pick(proto byte, port int) *member {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var cand []*member
+	best := int32(-1)
 	for _, m := range p.s {
 		set := m.tcp
 		if proto == protoUDP {
 			set = m.udp
 		}
-		if set[port] {
+		if !set[port] {
+			continue
+		}
+		f := atomic.LoadInt32(&m.fails)
+		switch {
+		case best == -1 || f < best:
+			best = f
+			cand = cand[:0]
+			cand = append(cand, m)
+		case f == best:
 			cand = append(cand, m)
 		}
 	}
@@ -618,7 +642,7 @@ func (p *pool) pick(proto byte, port int) *yamux.Session {
 		return nil
 	}
 	p.i++
-	return cand[p.i%len(cand)].sess
+	return cand[p.i%len(cand)]
 }
 
 // hello (client -> server, first stream): [2B n][n x 2B tcp ports][2B m][m x 2B udp ports]
@@ -743,23 +767,26 @@ func serveExposed(port int, p *pool) {
 		}
 		go func() {
 			tune(c)
-			sess := p.pick(protoTCP, port)
-			if sess == nil {
+			m := p.pick(protoTCP, port)
+			if m == nil {
 				logOnce(fmt.Sprintf("notun-tcp-%d", port), "tcp :%d: connection from %s dropped: no connected client serves this port (%s). Check that the client is connected and its -ports includes %d", port, c.RemoteAddr(), p.describe(), port)
 				c.Close()
 				return
 			}
-			st, err := sess.Open()
+			st, err := m.sess.Open()
 			if err != nil {
+				m.fail()
 				logOnce("open-stream", "cannot open tunnel stream: %v", err)
 				c.Close()
 				return
 			}
 			if _, err := st.Write(streamHdr(protoTCP, port)); err != nil {
+				m.fail()
 				st.Close()
 				c.Close()
 				return
 			}
+			m.ok()
 			pipe(c, st)
 		}()
 	}
@@ -828,21 +855,24 @@ func serveUDP(port int, p *pool) {
 		mu.Lock()
 		f := flows[key]
 		if f == nil {
-			sess := p.pick(protoUDP, port)
-			if sess == nil {
+			m := p.pick(protoUDP, port)
+			if m == nil {
 				mu.Unlock()
 				continue
 			}
-			st, err := sess.Open()
+			st, err := m.sess.Open()
 			if err != nil {
+				m.fail()
 				mu.Unlock()
 				continue
 			}
 			if _, err := st.Write(streamHdr(protoUDP, port)); err != nil {
+				m.fail()
 				st.Close()
 				mu.Unlock()
 				continue
 			}
+			m.ok()
 			f = &udpFlow{st: st}
 			flows[key] = f
 			go func(src net.Addr, st net.Conn) { // tunnel -> user

@@ -5,6 +5,19 @@ a change in the **minor** number (`0.1.x` → `0.2.0`) may break compatibility b
 so update the inside and the outside server together. Patch releases (`0.1.0` → `0.1.1`) are
 compatible with each other.
 
+## [0.2.3]
+
+- The server's port-forwarding no longer picks a member tunnel with plain
+  round-robin alone: each member now tracks a lightweight health score
+  (consecutive stream open/write failures), and `pick()` prefers whichever
+  currently-connected members have the fewest recent failures, falling
+  back to round-robin among equally-healthy ones. A member that starts
+  failing (one path in a multi-transport or multi-server setup degrading)
+  is steered away from automatically without being dropped from the pool -
+  it keeps getting tried again and recovers on its own once it succeeds
+  again, or once every other member is in the same shape. No flags, no
+  wire changes; purely server-side.
+
 ## [0.2.2]
 
 - Fixed: the UDP transport's KCP layer was sending its own packet header

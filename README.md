@@ -150,6 +150,9 @@ Users connect to `INSIDE_IP:443` (TCP) or `INSIDE_IP:51820` (UDP) and reach `127
 | `-pad` | both | Maximum random padding per frame in bytes (default `128`, `0` = off, max `4096`) |
 | `-conns` | client | Parallel tunnel connections per inside server (default `4`) |
 | `-rotate` | client | Proactively replace each tunnel connection on this jittered timer, e.g. `5m`, `3m` (default `5m`, `0` disables) |
+| `-source-ips` | client | Comma separated local IPs to rotate through when dialing out (must already be assigned to a network interface) |
+| `-fragment` | both | Randomize frame boundaries instead of always filling to the maximum size (default `true`) |
+| `-junk` | both | Send a decoy frame on this jittered interval, e.g. `20s` (default `0`, off) |
 | `-bind` | server | IP the user-facing ports listen on (default: all interfaces) |
 | `-window` | both | Per-stream window in KB (default `1024`). Use `256` on slow or unstable links, larger values (up to `8192`) only on fast, high-latency links |
 
@@ -196,6 +199,15 @@ Some paths throttle a single long-lived tunnel connection after roughly 10-20 mi
 ```
 
 Lower it (e.g. `-rotate 3m`) if you still see disconnects after a predictable number of minutes; `-rotate 0` disables rotation entirely. `setup.sh install` asks for this value on the outside server.
+
+## Making traffic shape less recognisable
+
+Two settings add noise to the traffic's shape, independent of the padding and encrypted frame lengths already in place:
+
+- **`-fragment`** (on by default) randomizes how application writes are split into frames, so frame sizes don't line up with write boundaries.
+- **`-junk 20s`** (off by default) sends a content-free decoy frame on a jittered timer. The receiving side already discards any frame with no real content, so turning this on needs no change on the other end, though the other end can enable its own `-junk` independently for traffic in both directions.
+
+Neither is a proven defense against a specific filter; both only add noise to the shape of the traffic.
 
 ## Troubleshooting
 

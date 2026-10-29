@@ -434,7 +434,8 @@ set_conf_var() { # set_conf_var NAME VALUE -- upserts NAME=VALUE in $CONF
 }
 
 do_enable_transport() {
-  local name="$1" unit="/etc/systemd/system/stacktunnel-${name}.service" args listen=""
+  local name="$1"
+  local unit="/etc/systemd/system/stacktunnel-${name}.service" args listen=""
   [[ -f "$CONF" ]] || { err "No config found - run 'install' first."; return 1; }
   # shellcheck disable=SC1090
   source "$CONF"

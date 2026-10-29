@@ -911,6 +911,14 @@ func serveUDP(port int, p *pool) {
 	}
 }
 
+// runServer starts the exposed-port listeners exactly once, then one accept
+// loop per entry in transports - all feeding the same pool p. This is what
+// actually gives automatic failover between transports on the server side:
+// an earlier design ran a second, independent stacktunnel process per extra
+// transport, but each process has its own pool, so they could never join
+// the same failover group, and both tried to bind the same exposed user
+// ports and crashed. Running every requested transport inside this one
+// process against this one pool is the fix.
 func runServer(addr, psk string, ports, udpPorts []int) {
 	p := &pool{}
 	for _, port := range ports {
@@ -919,14 +927,24 @@ func runServer(addr, psk string, ports, udpPorts []int) {
 	for _, port := range udpPorts {
 		go serveUDP(port, p)
 	}
-	if transport == "udp" {
-		runServerKCP(addr, psk, p)
-		return
+	for _, tr := range transports {
+		switch tr {
+		case "udp":
+			go runServerKCP(addr, psk, p)
+		case "ws":
+			wsAddr := wsListen
+			if wsAddr == "" {
+				wsAddr = addr
+			}
+			go runServerWS(wsAddr, psk, p)
+		default:
+			go runServerTCP(addr, psk, p)
+		}
 	}
-	if transport == "ws" {
-		runServerWS(addr, psk, p)
-		return
-	}
+	select {}
+}
+
+func runServerTCP(addr, psk string, p *pool) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatal(err)
@@ -1125,7 +1143,7 @@ func runServerKCP(addr, psk string, p *pool) {
 // redundant here (TLS already hides it) but harmless, and reusing it
 // exactly as-is avoids touching proven code for this addition.
 
-var wsHost, wsPath, wsCert, wsKeyFile string
+var wsHost, wsPath, wsCert, wsKeyFile, wsListen string
 var wsPort = 443
 var wsTLS = true // client: dial -ws-host over real TLS; set false only if -ws-host is already a plaintext endpoint
 
@@ -1382,23 +1400,50 @@ func runServerWS(addr, psk string, p *pool) {
 	}
 }
 
-// transport selects the tunnel connection's wire transport: "tcp" (default,
-// the fake-SSH banner over TCP), "udp" (STUN probe + KCP+FEC), or "ws" (real
-// TLS + WebSocket to a real domain).
-var transport = "tcp"
+// transports is the parsed, deduplicated list from -transport: one or more
+// of "tcp" (default, the fake-SSH banner over TCP), "udp" (STUN probe +
+// KCP+FEC) and "ws" (real TLS + WebSocket to a real domain). Listing more
+// than one runs them all at once, in the same process, feeding the same
+// pool (server side) or dialing in parallel (client side) - so if one gets
+// blocked, the others keep the tunnel up with no further action needed.
+// A single value behaves exactly as before.
+var transports = []string{"tcp"}
 
-func dialTunnel(addr, psk string) (net.Conn, error) {
-	if transport == "ws" {
-		return dialWS(addr)
+func parseTransports(s string) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range strings.Split(s, ",") {
+		t := strings.TrimSpace(raw)
+		if t == "" {
+			continue
+		}
+		if t != "tcp" && t != "udp" && t != "ws" {
+			return nil, fmt.Errorf("unknown transport %q (must be tcp, udp or ws)", t)
+		}
+		if !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
 	}
-	if transport == "udp" {
-		return dialKCP(addr, psk)
+	if len(out) == 0 {
+		return nil, errors.New("-transport: at least one transport is required")
 	}
-	return dialWithSource(addr)
+	return out, nil
 }
 
-func connectSession(addr, psk string, allowed, allowedUDP map[int]bool) (*yamux.Session, error) {
-	c, err := dialTunnel(addr, psk)
+func dialTunnel(tr, addr, psk string) (net.Conn, error) {
+	switch tr {
+	case "ws":
+		return dialWS(addr)
+	case "udp":
+		return dialKCP(addr, psk)
+	default:
+		return dialWithSource(addr)
+	}
+}
+
+func connectSession(tr, addr, psk string, allowed, allowedUDP map[int]bool) (*yamux.Session, error) {
+	c, err := dialTunnel(tr, addr, psk)
 	if err != nil {
 		return nil, err
 	}
@@ -1486,12 +1531,12 @@ func retireSession(sess *yamux.Session, label string) {
 // is non-zero, the connection is proactively replaced every rotate (jittered
 // ±25%) by opening a fresh one and retiring the old one, so no single
 // connection lives long enough to accumulate whatever caused the slowdowns.
-func runClientSlot(addr, psk string, allowed, allowedUDP map[int]bool, idx int, rotate time.Duration) {
-	label := fmt.Sprintf("%s #%d", addr, idx)
+func runClientSlot(tr, addr, psk string, allowed, allowedUDP map[int]bool, idx int, rotate time.Duration) {
+	label := fmt.Sprintf("%s [%s] #%d", addr, tr, idx)
 	backoff := time.Second
 	for {
 		start := time.Now()
-		sess, err := connectSession(addr, psk, allowed, allowedUDP)
+		sess, err := connectSession(tr, addr, psk, allowed, allowedUDP)
 		if err != nil {
 			log.Printf("[%s] disconnected: %v", label, err)
 			time.Sleep(backoff)
@@ -1537,17 +1582,30 @@ func runClient(addr, psk string, ports, udpPorts []int, conns int, rotate time.D
 	for _, p := range udpPorts {
 		allowedUDP[p] = true
 	}
-	// addr may be a comma separated list: one kharej -> several Iran servers
-	for _, target := range strings.Split(addr, ",") {
-		target = strings.TrimSpace(target)
-		if target == "" {
+	for _, tr := range transports {
+		if tr == "ws" {
+			// dialWS ignores addr entirely (it dials -ws-host:-ws-port), so
+			// this doesn't go through the -tunnel target list below.
+			for i := 0; i < conns; i++ {
+				go func(i int) {
+					time.Sleep(time.Duration(i) * 300 * time.Millisecond)
+					runClientSlot("ws", wsHost, psk, allowed, allowedUDP, i, rotate)
+				}(i)
+			}
 			continue
 		}
-		for i := 0; i < conns; i++ {
-			go func(target string, i int) {
-				time.Sleep(time.Duration(i) * 300 * time.Millisecond)
-				runClientSlot(target, psk, allowed, allowedUDP, i, rotate)
-			}(target, i)
+		// addr may be a comma separated list: one kharej -> several Iran servers
+		for _, target := range strings.Split(addr, ",") {
+			target = strings.TrimSpace(target)
+			if target == "" {
+				continue
+			}
+			for i := 0; i < conns; i++ {
+				go func(tr, target string, i int) {
+					time.Sleep(time.Duration(i) * 300 * time.Millisecond)
+					runClientSlot(tr, target, psk, allowed, allowedUDP, i, rotate)
+				}(tr, target, i)
+			}
 		}
 	}
 	select {}
@@ -1873,7 +1931,7 @@ func main() {
 	junk := flag.Duration("junk", 0, "send a decoy frame on this jittered interval to add timing/size noise, e.g. 20s (0 = off)")
 	win := flag.Int("window", 1024, "per-stream window in KB (try 256 on slow/unstable links, up to 8192 on fast ones)")
 	windows := flag.String("windows", "256,1024,4096,8192", "tune modes: window sizes (KB) to try")
-	trans := flag.String("transport", "tcp", "tunnel transport: tcp (fake-SSH banner), udp (STUN probe + KCP+FEC) or ws (real TLS+WebSocket to a real domain)")
+	trans := flag.String("transport", "tcp", "tunnel transport(s), comma separated: tcp (fake-SSH banner), udp (STUN probe + KCP+FEC) and/or ws (real TLS+WebSocket to a real domain). Listing more than one, e.g. tcp,udp, runs them all at once with automatic failover between them")
 	fecD := flag.Int("fec-data", 10, "transport=udp: number of data shards per FEC group")
 	fecP := flag.Int("fec-parity", 3, "transport=udp: number of parity shards per FEC group (0 disables FEC)")
 	wsHostFlag := flag.String("ws-host", "", "transport=ws: public hostname used as SNI/Host on the client side (required to dial)")
@@ -1882,6 +1940,7 @@ func main() {
 	wsCertFlag := flag.String("ws-cert", "", "transport=ws server: TLS certificate file; leave unset together with -ws-key to serve plain HTTP (e.g. behind Cloud Run/nginx or a CDN that already terminates TLS)")
 	wsKeyFlag := flag.String("ws-key", "", "transport=ws server: TLS private key file, paired with -ws-cert")
 	wsTLSFlag := flag.Bool("ws-tls", true, "transport=ws client: dial -ws-host over real TLS (disable only if -ws-host is itself already a plaintext endpoint)")
+	wsListenFlag := flag.String("ws-listen", "", "transport=ws server: address to listen on if different from -tunnel (required when ws is combined with tcp, since both would otherwise try to bind the same TCP address)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -1914,10 +1973,19 @@ func main() {
 		}
 	}
 	bindAddr = *bind
-	if *trans != "tcp" && *trans != "udp" && *trans != "ws" {
-		log.Fatal("-transport must be tcp, udp or ws")
+	trs, err := parseTransports(*trans)
+	if err != nil {
+		log.Fatal(err)
 	}
-	transport = *trans
+	transports = trs
+	hasTransport := func(t string) bool {
+		for _, x := range transports {
+			if x == t {
+				return true
+			}
+		}
+		return false
+	}
 	if *fecD < 0 || *fecP < 0 {
 		log.Fatal("-fec-data and -fec-parity must be >= 0")
 	}
@@ -1928,11 +1996,15 @@ func main() {
 	wsCert = *wsCertFlag
 	wsKeyFile = *wsKeyFlag
 	wsTLS = *wsTLSFlag
-	if transport == "ws" && *mode == "client" && wsHost == "" {
+	wsListen = *wsListenFlag
+	if hasTransport("ws") && *mode == "client" && wsHost == "" {
 		log.Fatal("-transport ws requires -ws-host on the client side")
 	}
-	if transport == "ws" && (wsCert == "") != (wsKeyFile == "") {
+	if hasTransport("ws") && (wsCert == "") != (wsKeyFile == "") {
 		log.Fatal("-ws-cert and -ws-key must be set together, or neither")
+	}
+	if hasTransport("ws") && hasTransport("tcp") && *mode == "server" && wsListen == "" {
+		log.Fatal("-transport includes both tcp and ws on the server: set -ws-listen to a different address for the ws listener (they can't both bind the same TCP address)")
 	}
 	log.Printf("stacktunnel %s starting (%s)", version, *mode)
 	switch *mode {

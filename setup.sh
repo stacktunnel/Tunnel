@@ -12,11 +12,9 @@ CONF_DIR="/etc/stacktunnel"
 CONF="$CONF_DIR/config.env"
 UNIT="/etc/systemd/system/${SERVICE}.service"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# standalone ws service (see do_add_ws_service) - separate from $SERVICE
-WS_SERVICE="stacktunnel-ws"
-WS_UNIT="/etc/systemd/system/${WS_SERVICE}.service"
-WS_CONF="$CONF_DIR/config-ws.env"
+# Standalone ws services (see do_add_ws_service) are named instances:
+# stacktunnel-ws-<name>.service / config-ws-<name>.env under $CONF_DIR -
+# separate from $SERVICE, and from each other.
 
 R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[36m'; N=$'\e[0m'
 info() { echo "${B}[i]${N} $*"; }
@@ -409,12 +407,15 @@ do_status() {
   fi
   echo
   journalctl -u "$SERVICE" -n 10 --no-pager
-  if [[ -f "$WS_UNIT" ]]; then
+  local f name
+  for f in /etc/systemd/system/stacktunnel-ws-*.service; do
+    [[ -e "$f" ]] || continue
+    name="$(basename "$f" .service)"
     echo
-    echo "${B}--- ${WS_SERVICE} (standalone) ---${N}"
-    systemctl --no-pager status "$WS_SERVICE" | head -n 6
-    journalctl -u "$WS_SERVICE" -n 6 --no-pager
-  fi
+    echo "${B}--- ${name} (standalone) ---${N}"
+    systemctl --no-pager status "$name" | head -n 6
+    journalctl -u "$name" -n 6 --no-pager
+  done
 }
 
 # ---------- extra transports ----------
@@ -619,7 +620,7 @@ do_remove_transport() {
   fi
 }
 
-# ---------- standalone ws service ----------
+# ---------- standalone ws service(s) ----------
 #
 # do_add_transport (above) merges ws into the SAME process/pool as tcp/udp,
 # so the Go code's own failover picks between them automatically on every
@@ -632,6 +633,37 @@ do_remove_transport() {
 # don't need one). That lets you wire ws up as its own outbound/inbound in
 # your own panel (e.g. a second x-ui inbound pointed at its port) and switch
 # between them with your panel's own balancer instead of this program's.
+#
+# Each instance is named (e.g. "arvan", "aws", "cloudrun") so you can run
+# several at once - one per front/provider, each its own
+# stacktunnel-ws-<name> service, own unit, own port(s), own -ws-host.
+
+ws_instance_unit() { echo "/etc/systemd/system/stacktunnel-ws-${1}.service"; }
+ws_instance_conf() { echo "${CONF_DIR}/config-ws-${1}.env"; }
+
+do_list_ws_services() {
+  local f name found=0
+  for f in /etc/systemd/system/stacktunnel-ws-*.service; do
+    [[ -e "$f" ]] || continue
+    found=1
+    name="$(basename "$f" .service)"
+    name="${name#stacktunnel-ws-}"
+    local active; active="$(systemctl is-active "stacktunnel-ws-${name}" 2>/dev/null || echo unknown)"
+    echo "  - ${name}  (stacktunnel-ws-${name}.service, ${active})"
+  done
+  [[ "$found" == 0 ]] && echo "  (none yet)"
+}
+
+do_remove_ws_service() {
+  local name="$1" unit conf
+  [[ -z "$name" ]] && { err "Usage: remove-ws-service NAME"; return 1; }
+  unit="$(ws_instance_unit "$name")"; conf="$(ws_instance_conf "$name")"
+  [[ -f "$unit" ]] || { err "No such ws service: ${name}"; return 1; }
+  systemctl disable --now "stacktunnel-ws-${name}" 2>/dev/null
+  rm -f "$unit" "$conf"
+  systemctl daemon-reload
+  ok "Removed stacktunnel-ws-${name}."
+}
 
 do_add_ws_service() {
   [[ -f "$UNIT" ]] || { err "Install the primary service first (option 1)."; return 1; }
@@ -646,9 +678,20 @@ do_add_ws_service() {
   info "its port) and switch between them yourself - this is independent of"
   info "the -transport tcp,udp,ws failover from option 10/enable-ws."
   echo
+  info "Existing standalone ws services:"
+  do_list_ws_services
+  echo
 
-  if systemctl list-unit-files 2>/dev/null | grep -q "^${WS_SERVICE}.service"; then
-    warn "${WS_SERVICE} is already installed; stopping it to reconfigure."
+  local name="${1:-}"
+  while [[ -z "$name" || ! "$name" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]]; do
+    name=$(ask "Short name for THIS one (lowercase letters/digits/hyphens, e.g. arvan, aws, cloudrun)")
+  done
+  local WS_SERVICE="stacktunnel-ws-${name}"
+  local WS_UNIT; WS_UNIT="$(ws_instance_unit "$name")"
+  local WS_CONF; WS_CONF="$(ws_instance_conf "$name")"
+
+  if [[ -f "$WS_UNIT" ]]; then
+    warn "${WS_SERVICE} already exists; stopping it to reconfigure."
     systemctl stop "$WS_SERVICE" 2>/dev/null || true
   fi
 
@@ -854,8 +897,10 @@ menu() {
   echo "  8) Uninstall"
   echo "  9) Add UDP fallback transport (same service, auto-failover)"
   echo " 10) Add WS/CDN fallback transport (same service, auto-failover)"
-  echo " 11) Add WS/CDN as a STANDALONE service (own port, own outbound - you switch)"
+  echo " 11) Add a STANDALONE ws service (own port/provider - you switch)"
   echo " 12) Remove a transport from the primary service (back to tcp[,udp])"
+  echo " 13) List standalone ws services"
+  echo " 14) Remove a standalone ws service"
   echo "  0) Exit"
   case "$(ask "Choice")" in
     1) do_install ;;
@@ -870,6 +915,8 @@ menu() {
     10) do_add_transport ws ;;
     11) do_add_ws_service ;;
     12) do_remove_transport "$(ask "Transport to remove (udp or ws)")" ;;
+    13) do_list_ws_services ;;
+    14) do_remove_ws_service "$(ask "Name of the standalone ws service to remove")" ;;
     *) exit 0 ;;
   esac
 }
@@ -888,7 +935,9 @@ case "${1:-}" in
   enable-udp)   do_add_transport udp ;;
   enable-ws)    do_add_transport ws ;;
   disable-transport) do_remove_transport "${2:-}" ;;
-  add-ws-service)    do_add_ws_service ;;
+  add-ws-service)    do_add_ws_service "${2:-}" ;;
+  list-ws-services)  do_list_ws_services ;;
+  remove-ws-service) do_remove_ws_service "${2:-}" ;;
   "")           menu ;;
-  *)            echo "Usage: bash $0 [install|status|logs|restart|update|tune|window N|show|uninstall|enable-udp|enable-ws|disable-transport NAME|add-ws-service]" ;;
+  *)            echo "Usage: bash $0 [install|status|logs|restart|update|tune|window N|show|uninstall|enable-udp|enable-ws|disable-transport NAME|add-ws-service [NAME]|list-ws-services|remove-ws-service NAME]" ;;
 esac

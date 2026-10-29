@@ -298,7 +298,7 @@ do_install() {
 MODE=${mode}
 KEY=${key}
 TUNNEL_PORT=${tun_port}
-IRAN_IP=${iran_ip:-}
+IRAN_IP=${targets:-}
 TCP_PORTS=${tcp_ports}
 UDP_PORTS=${udp_ports}
 PAD=${pad}
@@ -404,25 +404,24 @@ do_status() {
   fi
   echo
   journalctl -u "$SERVICE" -n 10 --no-pager
-  local f name
-  for f in /etc/systemd/system/stacktunnel-*.service; do
-    [[ -f "$f" ]] || continue
-    name="$(basename "$f" .service)"
-    echo
-    echo "${B}--- ${name} ---${N}"
-    systemctl --no-pager status "$name" | head -n 6
-  done
 }
 
 # ---------- extra transports ----------
 #
-# Every transport (tcp, udp, ws) connects to the SAME pool on the server
-# side, and pool/member already fail over between whichever members are
-# currently connected and healthy (see CHANGELOG 0.2.3) - so running a
-# second, independent transport alongside the primary one is purely
-# additive automatic resilience: if one gets blocked, traffic keeps moving
-# over whichever other one still gets through, with no further wiring.
-# This just saves you from hand-writing a second systemd unit yourself.
+# main.go (0.4.0+) can run several transports (tcp, udp, ws) at once INSIDE
+# ONE process, all feeding the same pool, with the exposed user-facing
+# ports bound exactly once - that's what actually gives automatic failover:
+# if one transport gets blocked, traffic keeps moving over whichever other
+# one still gets through, with no further action needed.
+#
+# An earlier version of this did it by running a second, fully separate
+# stacktunnel process (its own systemd unit) per extra transport. That
+# cannot work: each process has its own pool, so the two could never join
+# the same failover group, and both tried to bind the very same exposed
+# TCP ports, which crash-loops with "address already in use" the moment
+# both are enabled. This replaces that approach: adding a transport now
+# edits the ONE existing service's -transport list in place and restarts
+# it, instead of creating a second unit.
 
 set_conf_var() { # set_conf_var NAME VALUE -- upserts NAME=VALUE in $CONF
   local name="$1" val="$2"
@@ -433,25 +432,53 @@ set_conf_var() { # set_conf_var NAME VALUE -- upserts NAME=VALUE in $CONF
   fi
 }
 
-do_enable_transport() {
-  local name="$1"
-  local unit="/etc/systemd/system/stacktunnel-${name}.service" args listen=""
+set_unit_flag() { # set_unit_flag -flag value -- upserts "-flag value" on $UNIT's ExecStart line
+  local flag="$1" val="$2"
+  if grep -qF -- "${flag} " "$UNIT"; then
+    sed -i -E "s|${flag} [^ ]*|${flag} ${val}|" "$UNIT"
+  else
+    sed -i -E "s|^(ExecStart=.*)|\1 ${flag} ${val}|" "$UNIT"
+  fi
+}
+
+# update_transport NAME -- adds NAME to the -transport list on $UNIT's
+# ExecStart line (deduplicated) and echoes the resulting list.
+update_transport() {
+  local newname="$1" execline current newlist
+  execline="$(grep '^ExecStart=' "$UNIT")"
+  current="$(echo "$execline" | grep -oE -- '-transport [^ ]+' | awk '{print $2}')"
+  [[ -z "$current" ]] && current="tcp"
+  if [[ ",${current}," == *",${newname},"* ]]; then
+    echo "$current"
+    return 0
+  fi
+  newlist="${current},${newname}"
+  if echo "$execline" | grep -qE -- '-transport [^ ]+'; then
+    sed -i -E "s|-transport [^ ]+|-transport ${newlist}|" "$UNIT"
+  else
+    sed -i -E "s|^(ExecStart=.*)|\1 -transport ${newlist}|" "$UNIT"
+  fi
+  echo "$newlist"
+}
+
+do_add_transport() {
+  local name="$1" current
+  [[ -f "$UNIT" ]] || { err "Service is not installed. Run: sudo bash $0 install"; return 1; }
   [[ -f "$CONF" ]] || { err "No config found - run 'install' first."; return 1; }
   # shellcheck disable=SC1090
   source "$CONF"
 
-  if [[ "$MODE" == "server" ]]; then
-    args="-mode server -key ${KEY} -tunnel :${TUNNEL_PORT} -pad ${PAD}"
-  else
-    args="-mode client -key ${KEY} -tunnel ${IRAN_IP} -pad ${PAD} -conns ${CONNS} -rotate ${ROTATE}"
+  current="$(grep '^ExecStart=' "$UNIT" | grep -oE -- '-transport [^ ]+' | awk '{print $2}')"
+  [[ -z "$current" ]] && current="tcp"
+  if [[ ",${current}," == *",${name},"* ]]; then
+    ok "${name} is already enabled on this service (-transport ${current})."
+    return 0
   fi
-  [[ -n "${TCP_PORTS:-}" ]] && args+=" -ports ${TCP_PORTS}"
-  [[ -n "${UDP_PORTS:-}" ]] && args+=" -udp ${UDP_PORTS}"
-  args+=" -transport ${name}"
 
   case "$name" in
     udp)
-      : # same tunnel address/port as the primary service, just a different transport on it
+      : # tcp and udp are different OS-level sockets, so they share the
+        # same -tunnel address/port with no conflict.
       ;;
     ws)
       echo
@@ -459,71 +486,60 @@ do_enable_transport() {
       info "HTTPS visit, and to sit behind something that already looks like one"
       info "(a CDN edge, or e.g. nginx inside Google Cloud Run forwarding to this"
       info "server). This is the transport to use as a shutdown-period fallback."
-      local ws_host ws_port ws_path tls_yn ws_cert ws_key
+      local ws_path
       ws_path=$(ask "HTTP path for the WebSocket upgrade" "${WS_PATH:-/}")
+      set_unit_flag -ws-path "$ws_path"
+      set_conf_var WS_PATH "$ws_path"
       if [[ "$MODE" == "client" ]]; then
+        local ws_host ws_port
         ws_host=$(ask "Public hostname to dial (SNI = Host), e.g. myapp-xyz.run.app" "${WS_HOST:-}")
         [[ -z "$ws_host" ]] && { err "A host is required on the client side."; return 1; }
         ws_port=$(ask "Port" "${WS_PORT:-443}")
-        args+=" -ws-host ${ws_host} -ws-port ${ws_port} -ws-path ${ws_path}"
+        set_unit_flag -ws-host "$ws_host"
+        set_unit_flag -ws-port "$ws_port"
         set_conf_var WS_HOST "$ws_host"
         set_conf_var WS_PORT "$ws_port"
       else
+        local tls_yn
         echo "Does THIS server terminate TLS itself, or does something in front of it"
         echo "(nginx inside Cloud Run, a CDN, a load balancer) already terminate TLS"
         echo "before forwarding here?"
         tls_yn=$(ask "Terminate TLS on this server itself? [y/N]" "n")
         if [[ "$tls_yn" =~ ^[Yy] ]]; then
+          local ws_cert ws_key
           ws_cert=$(ask "Path to TLS certificate file")
           ws_key=$(ask "Path to TLS private key file")
-          listen=$(ask "Listen address" ":443")
-          args+=" -ws-cert ${ws_cert} -ws-key ${ws_key}"
+          set_unit_flag -ws-cert "$ws_cert"
+          set_unit_flag -ws-key "$ws_key"
           set_conf_var WS_CERT "$ws_cert"
           set_conf_var WS_KEY "$ws_key"
-        else
-          listen=$(ask "Listen address (plain HTTP - point whatever forwards to you here)" "127.0.0.1:8080")
         fi
-        args+=" -ws-path ${ws_path}"
+        if [[ ",${current}," == *",tcp,"* ]]; then
+          warn "tcp is also enabled: ws can't bind the same address/port as tcp on this server."
+          local ws_listen
+          ws_listen=$(ask "Address for the ws listener (a different port)" "127.0.0.1:8080")
+          set_unit_flag -ws-listen "$ws_listen"
+          set_conf_var WS_LISTEN "$ws_listen"
+        fi
       fi
-      set_conf_var WS_PATH "$ws_path"
       ;;
     *)
       err "Unknown transport: $name"
       return 1
       ;;
   esac
-  if [[ -n "$listen" ]]; then
-    args="${args/-tunnel :${TUNNEL_PORT}/-tunnel ${listen}}"
-  fi
 
-  cat >"$unit" <<EOF
-[Unit]
-Description=StackTunnel (${MODE}, ${name} transport)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${BIN} ${args}
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  chmod 600 "$unit"
-
+  local newlist
+  newlist="$(update_transport "$name")"
   systemctl daemon-reload
-  systemctl enable "stacktunnel-${name}" >/dev/null 2>&1
-  systemctl restart "stacktunnel-${name}"
+  systemctl restart "$SERVICE"
   sleep 2
 
-  if systemctl is-active --quiet "stacktunnel-${name}"; then
-    ok "stacktunnel-${name} is running alongside stacktunnel (primary) - failover between them is automatic."
+  if systemctl is-active --quiet "$SERVICE"; then
+    ok "${SERVICE} is now running with -transport ${newlist} - failover between them is automatic."
   else
-    err "stacktunnel-${name} failed to start. Log:"
-    journalctl -u "stacktunnel-${name}" -n 20 --no-pager
+    err "${SERVICE} failed to start with -transport ${newlist}. Log:"
+    journalctl -u "$SERVICE" -n 20 --no-pager
     return 1
   fi
 
@@ -627,8 +643,8 @@ menu() {
   echo "  6) Speed test / choose window size"
   echo "  7) Show config (includes key)"
   echo "  8) Uninstall"
-  echo "  9) Enable UDP fallback transport (parallel service, auto-failover)"
-  echo " 10) Enable WS/CDN fallback transport (for shutdown periods)"
+  echo "  9) Add UDP fallback transport (same service, auto-failover)"
+  echo " 10) Add WS/CDN fallback transport (for shutdown periods)"
   echo "  0) Exit"
   case "$(ask "Choice")" in
     1) do_install ;;
@@ -639,8 +655,8 @@ menu() {
     6) do_tune ;;
     7) do_show ;;
     8) do_uninstall ;;
-    9) do_enable_transport udp ;;
-    10) do_enable_transport ws ;;
+    9) do_add_transport udp ;;
+    10) do_add_transport ws ;;
     *) exit 0 ;;
   esac
 }
@@ -656,8 +672,8 @@ case "${1:-}" in
   window)     do_window "${2:-}" ;;
   show)       do_show ;;
   uninstall)  do_uninstall ;;
-  enable-udp) do_enable_transport udp ;;
-  enable-ws)  do_enable_transport ws ;;
+  enable-udp) do_add_transport udp ;;
+  enable-ws)  do_add_transport ws ;;
   "")         menu ;;
   *)          echo "Usage: bash $0 [install|status|logs|restart|update|tune|window N|show|uninstall|enable-udp|enable-ws]" ;;
 esac

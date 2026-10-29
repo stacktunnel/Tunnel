@@ -5,6 +5,22 @@ a change in the **minor** number (`0.1.x` → `0.2.0`) may break compatibility b
 so update the inside and the outside server together. Patch releases (`0.1.0` → `0.1.1`) are
 compatible with each other.
 
+## [0.4.1]
+
+- Fix: the ws transport has always assumed -mode client dials and -mode
+  server listens, same as tcp/udp. But ws's whole point is to let the side
+  with restrictive outbound connectivity (usually the Iran server) reach out
+  through a CDN/front - which on this project is -mode server, the side that
+  would otherwise listen. Running `enable-ws` on the kharej/outside box
+  (-mode client) therefore always asked for a hostname to dial, even when
+  that box needed to listen behind its own nginx - there was no way to tell
+  it to do the opposite of what -mode already implies for ws. New flag
+  `-ws-reverse`: for ws only (tcp/udp are unaffected), -mode server dials out
+  (-ws-host/-ws-port) and -mode client listens (-ws-listen) instead.
+  `setup.sh enable-ws` now asks directly which role THIS machine plays for ws
+  (dial or listen) rather than assuming it from -mode, and sets -ws-reverse
+  when that disagrees with the normal direction.
+
 ## [0.4.0]
 
 - Fix (real one this time): running a second transport as a second,

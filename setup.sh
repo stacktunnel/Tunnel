@@ -404,6 +404,131 @@ do_status() {
   fi
   echo
   journalctl -u "$SERVICE" -n 10 --no-pager
+  local f name
+  for f in /etc/systemd/system/stacktunnel-*.service; do
+    [[ -f "$f" ]] || continue
+    name="$(basename "$f" .service)"
+    echo
+    echo "${B}--- ${name} ---${N}"
+    systemctl --no-pager status "$name" | head -n 6
+  done
+}
+
+# ---------- extra transports ----------
+#
+# Every transport (tcp, udp, ws) connects to the SAME pool on the server
+# side, and pool/member already fail over between whichever members are
+# currently connected and healthy (see CHANGELOG 0.2.3) - so running a
+# second, independent transport alongside the primary one is purely
+# additive automatic resilience: if one gets blocked, traffic keeps moving
+# over whichever other one still gets through, with no further wiring.
+# This just saves you from hand-writing a second systemd unit yourself.
+
+set_conf_var() { # set_conf_var NAME VALUE -- upserts NAME=VALUE in $CONF
+  local name="$1" val="$2"
+  if grep -q "^${name}=" "$CONF" 2>/dev/null; then
+    sed -i "s|^${name}=.*|${name}=${val}|" "$CONF"
+  else
+    echo "${name}=${val}" >>"$CONF"
+  fi
+}
+
+do_enable_transport() {
+  local name="$1" unit="/etc/systemd/system/stacktunnel-${name}.service" args listen=""
+  [[ -f "$CONF" ]] || { err "No config found - run 'install' first."; return 1; }
+  # shellcheck disable=SC1090
+  source "$CONF"
+
+  if [[ "$MODE" == "server" ]]; then
+    args="-mode server -key ${KEY} -tunnel :${TUNNEL_PORT} -pad ${PAD}"
+  else
+    args="-mode client -key ${KEY} -tunnel ${IRAN_IP} -pad ${PAD} -conns ${CONNS} -rotate ${ROTATE}"
+  fi
+  [[ -n "${TCP_PORTS:-}" ]] && args+=" -ports ${TCP_PORTS}"
+  [[ -n "${UDP_PORTS:-}" ]] && args+=" -udp ${UDP_PORTS}"
+  args+=" -transport ${name}"
+
+  case "$name" in
+    udp)
+      : # same tunnel address/port as the primary service, just a different transport on it
+      ;;
+    ws)
+      echo
+      info "ws is a real TLS+WebSocket connection - meant to look like an ordinary"
+      info "HTTPS visit, and to sit behind something that already looks like one"
+      info "(a CDN edge, or e.g. nginx inside Google Cloud Run forwarding to this"
+      info "server). This is the transport to use as a shutdown-period fallback."
+      local ws_host ws_port ws_path tls_yn ws_cert ws_key
+      ws_path=$(ask "HTTP path for the WebSocket upgrade" "${WS_PATH:-/}")
+      if [[ "$MODE" == "client" ]]; then
+        ws_host=$(ask "Public hostname to dial (SNI = Host), e.g. myapp-xyz.run.app" "${WS_HOST:-}")
+        [[ -z "$ws_host" ]] && { err "A host is required on the client side."; return 1; }
+        ws_port=$(ask "Port" "${WS_PORT:-443}")
+        args+=" -ws-host ${ws_host} -ws-port ${ws_port} -ws-path ${ws_path}"
+        set_conf_var WS_HOST "$ws_host"
+        set_conf_var WS_PORT "$ws_port"
+      else
+        echo "Does THIS server terminate TLS itself, or does something in front of it"
+        echo "(nginx inside Cloud Run, a CDN, a load balancer) already terminate TLS"
+        echo "before forwarding here?"
+        tls_yn=$(ask "Terminate TLS on this server itself? [y/N]" "n")
+        if [[ "$tls_yn" =~ ^[Yy] ]]; then
+          ws_cert=$(ask "Path to TLS certificate file")
+          ws_key=$(ask "Path to TLS private key file")
+          listen=$(ask "Listen address" ":443")
+          args+=" -ws-cert ${ws_cert} -ws-key ${ws_key}"
+          set_conf_var WS_CERT "$ws_cert"
+          set_conf_var WS_KEY "$ws_key"
+        else
+          listen=$(ask "Listen address (plain HTTP - point whatever forwards to you here)" "127.0.0.1:8080")
+        fi
+        args+=" -ws-path ${ws_path}"
+      fi
+      set_conf_var WS_PATH "$ws_path"
+      ;;
+    *)
+      err "Unknown transport: $name"
+      return 1
+      ;;
+  esac
+  if [[ -n "$listen" ]]; then
+    args="${args/-tunnel :${TUNNEL_PORT}/-tunnel ${listen}}"
+  fi
+
+  cat >"$unit" <<EOF
+[Unit]
+Description=StackTunnel (${MODE}, ${name} transport)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${BIN} ${args}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 600 "$unit"
+
+  systemctl daemon-reload
+  systemctl enable "stacktunnel-${name}" >/dev/null 2>&1
+  systemctl restart "stacktunnel-${name}"
+  sleep 2
+
+  if systemctl is-active --quiet "stacktunnel-${name}"; then
+    ok "stacktunnel-${name} is running alongside stacktunnel (primary) - failover between them is automatic."
+  else
+    err "stacktunnel-${name} failed to start. Log:"
+    journalctl -u "stacktunnel-${name}" -n 20 --no-pager
+    return 1
+  fi
+
+  if [[ "$MODE" == "server" && "$name" == "udp" ]] && command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+    ufw allow "${TUNNEL_PORT}/udp" >/dev/null 2>&1 && ok "Opened ${TUNNEL_PORT}/udp in ufw."
+  fi
 }
 
 do_update() {
@@ -501,6 +626,8 @@ menu() {
   echo "  6) Speed test / choose window size"
   echo "  7) Show config (includes key)"
   echo "  8) Uninstall"
+  echo "  9) Enable UDP fallback transport (parallel service, auto-failover)"
+  echo " 10) Enable WS/CDN fallback transport (for shutdown periods)"
   echo "  0) Exit"
   case "$(ask "Choice")" in
     1) do_install ;;
@@ -511,21 +638,25 @@ menu() {
     6) do_tune ;;
     7) do_show ;;
     8) do_uninstall ;;
+    9) do_enable_transport udp ;;
+    10) do_enable_transport ws ;;
     *) exit 0 ;;
   esac
 }
 
 need_root
 case "${1:-}" in
-  install)   do_install ;;
-  status)    do_status ;;
-  logs)      journalctl -u "$SERVICE" -f ;;
-  restart)   systemctl restart "$SERVICE" && ok "Restarted." ;;
-  update)    do_update ;;
-  tune)      do_tune ;;
-  window)    do_window "${2:-}" ;;
-  show)      do_show ;;
-  uninstall) do_uninstall ;;
-  "")        menu ;;
-  *)         echo "Usage: bash $0 [install|status|logs|restart|update|tune|window N|show|uninstall]" ;;
+  install)    do_install ;;
+  status)     do_status ;;
+  logs)       journalctl -u "$SERVICE" -f ;;
+  restart)    systemctl restart "$SERVICE" && ok "Restarted." ;;
+  update)     do_update ;;
+  tune)       do_tune ;;
+  window)     do_window "${2:-}" ;;
+  show)       do_show ;;
+  uninstall)  do_uninstall ;;
+  enable-udp) do_enable_transport udp ;;
+  enable-ws)  do_enable_transport ws ;;
+  "")         menu ;;
+  *)          echo "Usage: bash $0 [install|status|logs|restart|update|tune|window N|show|uninstall|enable-udp|enable-ws]" ;;
 esac

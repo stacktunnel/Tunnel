@@ -11,9 +11,13 @@
 package main
 
 import (
+	"bufio"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -22,6 +26,7 @@ import (
 	"log"
 	mrand "math/rand"
 	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -918,6 +923,10 @@ func runServer(addr, psk string, ports, udpPorts []int) {
 		runServerKCP(addr, psk, p)
 		return
 	}
+	if transport == "ws" {
+		runServerWS(addr, psk, p)
+		return
+	}
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatal(err)
@@ -1100,11 +1109,288 @@ func runServerKCP(addr, psk string, p *pool) {
 	}
 }
 
+// ---------- TLS+WebSocket transport (CDN-friendly) ----------
+//
+// A third transport, -transport ws: a real TLS connection to a real domain,
+// upgraded to a WebSocket, carrying the tunnel. Unlike the tcp/udp
+// transports, nothing here is disguised - it IS what it looks like, an
+// ordinary HTTPS+WebSocket connection, which is the point: everything after
+// the TLS ClientHello is opaque to a filter the same way any HTTPS site is,
+// so there is nothing resembling an "opener" for it to recognize in the
+// first place. The server needs a real certificate (e.g. Let's Encrypt) for
+// the domain; the domain can be put behind a CDN (Cloudflare or similar) so
+// the IP a filter would have to block is shared with many unrelated sites.
+// Everything above this transport - the fake-SSH handshake, the AEAD
+// framing, yamux - still runs unchanged on top, inside the WebSocket; it is
+// redundant here (TLS already hides it) but harmless, and reusing it
+// exactly as-is avoids touching proven code for this addition.
+
+var wsHost, wsPath, wsCert, wsKeyFile string
+var wsPort = 443
+var wsTLS = true // client: dial -ws-host over real TLS; set false only if -ws-host is already a plaintext endpoint
+
+// wsConn adapts a WebSocket (RFC 6455) connection to net.Conn, binary
+// frames only, no fragmentation support (callers here never send frames
+// larger than maxPlain+overhead+padMax, well under the single-frame range
+// this needs to handle).
+type wsConn struct {
+	net.Conn
+	isClient bool
+	br       *bufio.Reader
+	pending  []byte // leftover decoded payload from a partial Read
+}
+
+func wsAcceptKey(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key))
+	h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+func (w *wsConn) writeFrame(p []byte) error {
+	var hdr []byte
+	switch {
+	case len(p) <= 125:
+		hdr = []byte{0x82, byte(len(p))}
+	case len(p) <= 65535:
+		hdr = []byte{0x82, 126, byte(len(p) >> 8), byte(len(p))}
+	default:
+		hdr = make([]byte, 10)
+		hdr[0], hdr[1] = 0x82, 127
+		binary.BigEndian.PutUint64(hdr[2:], uint64(len(p)))
+	}
+	if w.isClient {
+		hdr[1] |= 0x80
+		var mask [4]byte
+		rand.Read(mask[:])
+		hdr = append(hdr, mask[:]...)
+		masked := make([]byte, len(p))
+		for i, b := range p {
+			masked[i] = b ^ mask[i%4]
+		}
+		p = masked
+	}
+	if _, err := w.Conn.Write(hdr); err != nil {
+		return err
+	}
+	_, err := w.Conn.Write(p)
+	return err
+}
+
+// Write splits p into frames no larger than maxPlain+overhead+padMax so a
+// single WS frame never needs to carry more than this transport is ever
+// asked to send in one secConn frame.
+func (w *wsConn) Write(p []byte) (int, error) {
+	const chunk = maxPlain + overhead + 64
+	for len(p) > 0 {
+		n := len(p)
+		if n > chunk {
+			n = chunk
+		}
+		if err := w.writeFrame(p[:n]); err != nil {
+			return 0, err
+		}
+		p = p[n:]
+	}
+	return len(p), nil
+}
+
+func (w *wsConn) readFrame() ([]byte, error) {
+	var h [2]byte
+	if _, err := io.ReadFull(w.br, h[:]); err != nil {
+		return nil, err
+	}
+	opcode := h[0] & 0x0f
+	masked := h[1]&0x80 != 0
+	n := uint64(h[1] & 0x7f)
+	switch n {
+	case 126:
+		var b [2]byte
+		if _, err := io.ReadFull(w.br, b[:]); err != nil {
+			return nil, err
+		}
+		n = uint64(binary.BigEndian.Uint16(b[:]))
+	case 127:
+		var b [8]byte
+		if _, err := io.ReadFull(w.br, b[:]); err != nil {
+			return nil, err
+		}
+		n = binary.BigEndian.Uint64(b[:])
+	}
+	var mask [4]byte
+	if masked {
+		if _, err := io.ReadFull(w.br, mask[:]); err != nil {
+			return nil, err
+		}
+	}
+	if n > 4<<20 {
+		return nil, errors.New("ws frame too large")
+	}
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(w.br, payload); err != nil {
+		return nil, err
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= mask[i%4]
+		}
+	}
+	if opcode == 0x8 { // close
+		return nil, io.EOF
+	}
+	if opcode == 0x9 || opcode == 0xa { // ping/pong: ignore and read the next frame
+		return w.readFrame()
+	}
+	return payload, nil
+}
+
+func (w *wsConn) Read(p []byte) (int, error) {
+	for len(w.pending) == 0 {
+		f, err := w.readFrame()
+		if err != nil {
+			return 0, err
+		}
+		w.pending = f
+	}
+	n := copy(p, w.pending)
+	w.pending = w.pending[n:]
+	return n, nil
+}
+
+// dialWS performs a real TLS handshake to wsHost:wsPort (SNI = wsHost, so
+// this is an ordinary TLS connection indistinguishable from visiting that
+// domain in a browser), then a standard WebSocket upgrade over it. Set
+// -ws-tls=false only when -ws-host is itself already a plaintext endpoint
+// (rare - normally the whole point is to look like a real HTTPS visit to a
+// real domain, e.g. a Google Cloud Run URL or any domain behind a CDN).
+func dialWS(addr string) (net.Conn, error) {
+	host := wsHost
+	if host == "" {
+		return nil, errors.New("-transport ws requires -ws-host")
+	}
+	target := fmt.Sprintf("%s:%d", host, wsPort)
+	var c net.Conn
+	var err error
+	if wsTLS {
+		c, err = tls.Dial("tcp", target, &tls.Config{ServerName: host})
+	} else {
+		c, err = net.DialTimeout("tcp", target, 10*time.Second)
+	}
+	if err != nil {
+		return nil, err
+	}
+	key := make([]byte, 16)
+	rand.Read(key)
+	keyB64 := base64.StdEncoding.EncodeToString(key)
+	path := wsPath
+	if path == "" {
+		path = "/"
+	}
+	req := "GET " + path + " HTTP/1.1\r\n" +
+		"Host: " + host + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: " + keyB64 + "\r\n" +
+		"Sec-WebSocket-Version: 13\r\n\r\n"
+	if _, err := c.Write([]byte(req)); err != nil {
+		c.Close()
+		return nil, err
+	}
+	br := bufio.NewReader(c)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols ||
+		resp.Header.Get("Sec-WebSocket-Accept") != wsAcceptKey(keyB64) {
+		c.Close()
+		return nil, fmt.Errorf("ws upgrade failed: %s", resp.Status)
+	}
+	return &wsConn{Conn: c, isClient: true, br: br}, nil
+}
+
+// runServerWS upgrades requests for wsPath to WebSocket and hands each one
+// to handleTunnel exactly like the tcp/udp transports; any other path gets
+// a plain 404 so a request that isn't the upgrade doesn't reveal anything.
+//
+// TLS here is optional, not required, because this process does not have
+// to be the public-facing edge. Two shapes are both valid:
+//   - -ws-cert/-ws-key given: this process terminates TLS itself (a real
+//     certificate for -ws-host) and can sit directly on the public internet.
+//   - neither given: this process speaks plain HTTP/WebSocket and is meant
+//     to sit behind something that already terminated TLS before forwarding
+//     here - a CDN edge, a load balancer, or an nginx reverse proxy inside a
+//     managed platform (e.g. Google Cloud Run terminates TLS on its public
+//     *.run.app/custom domain, and an nginx container there forwards the
+//     decrypted WebSocket traffic on to this process over a plain upstream
+//     connection). That is the shape to use when fronting this server with
+//     a provider whose own anycast/edge IPs are expensive for a filter to
+//     block outright.
+func runServerWS(addr, psk string, p *pool) {
+	if (wsCert == "") != (wsKeyFile == "") {
+		log.Fatal("-transport ws: set both -ws-cert and -ws-key, or neither (plain mode, for running behind something that already terminates TLS)")
+	}
+	path := wsPath
+	if path == "" {
+		path = "/"
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			http.NotFound(w, r)
+			return
+		}
+		key := r.Header.Get("Sec-WebSocket-Key")
+		hj, ok := w.(http.Hijacker)
+		if key == "" || !ok {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		conn, rw, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		resp := "HTTP/1.1 101 Switching Protocols\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Sec-WebSocket-Accept: " + wsAcceptKey(key) + "\r\n\r\n"
+		if _, err := rw.Write([]byte(resp)); err != nil {
+			conn.Close()
+			return
+		}
+		if err := rw.Flush(); err != nil {
+			conn.Close()
+			return
+		}
+		handleTunnel(&wsConn{Conn: conn, isClient: false, br: rw.Reader}, psk, p)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+	if wsCert != "" {
+		log.Printf("waiting for tunnel (tls+ws) on %s (path %s)", addr, path)
+		if err := srv.ListenAndServeTLS(wsCert, wsKeyFile); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	log.Printf("waiting for tunnel (plain ws) on %s (path %s) - expects TLS to already be terminated in front of this", addr, path)
+	if err := srv.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
+}
+
 // transport selects the tunnel connection's wire transport: "tcp" (default,
-// the fake-SSH banner over TCP) or "udp" (STUN probe + KCP+FEC).
+// the fake-SSH banner over TCP), "udp" (STUN probe + KCP+FEC), or "ws" (real
+// TLS + WebSocket to a real domain).
 var transport = "tcp"
 
 func dialTunnel(addr, psk string) (net.Conn, error) {
+	if transport == "ws" {
+		return dialWS(addr)
+	}
 	if transport == "udp" {
 		return dialKCP(addr, psk)
 	}
@@ -1587,9 +1873,15 @@ func main() {
 	junk := flag.Duration("junk", 0, "send a decoy frame on this jittered interval to add timing/size noise, e.g. 20s (0 = off)")
 	win := flag.Int("window", 1024, "per-stream window in KB (try 256 on slow/unstable links, up to 8192 on fast ones)")
 	windows := flag.String("windows", "256,1024,4096,8192", "tune modes: window sizes (KB) to try")
-	trans := flag.String("transport", "tcp", "tunnel transport: tcp (fake-SSH banner) or udp (STUN probe + KCP+FEC)")
+	trans := flag.String("transport", "tcp", "tunnel transport: tcp (fake-SSH banner), udp (STUN probe + KCP+FEC) or ws (real TLS+WebSocket to a real domain)")
 	fecD := flag.Int("fec-data", 10, "transport=udp: number of data shards per FEC group")
 	fecP := flag.Int("fec-parity", 3, "transport=udp: number of parity shards per FEC group (0 disables FEC)")
+	wsHostFlag := flag.String("ws-host", "", "transport=ws: public hostname used as SNI/Host on the client side (required to dial)")
+	wsPortFlag := flag.Int("ws-port", 443, "transport=ws client: port to dial on -ws-host")
+	wsPathFlag := flag.String("ws-path", "/", "transport=ws: HTTP path used for the WebSocket upgrade")
+	wsCertFlag := flag.String("ws-cert", "", "transport=ws server: TLS certificate file; leave unset together with -ws-key to serve plain HTTP (e.g. behind Cloud Run/nginx or a CDN that already terminates TLS)")
+	wsKeyFlag := flag.String("ws-key", "", "transport=ws server: TLS private key file, paired with -ws-cert")
+	wsTLSFlag := flag.Bool("ws-tls", true, "transport=ws client: dial -ws-host over real TLS (disable only if -ws-host is itself already a plaintext endpoint)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -1622,14 +1914,26 @@ func main() {
 		}
 	}
 	bindAddr = *bind
-	if *trans != "tcp" && *trans != "udp" {
-		log.Fatal("-transport must be tcp or udp")
+	if *trans != "tcp" && *trans != "udp" && *trans != "ws" {
+		log.Fatal("-transport must be tcp, udp or ws")
 	}
 	transport = *trans
 	if *fecD < 0 || *fecP < 0 {
 		log.Fatal("-fec-data and -fec-parity must be >= 0")
 	}
 	fecData, fecParity = *fecD, *fecP
+	wsHost = *wsHostFlag
+	wsPort = *wsPortFlag
+	wsPath = *wsPathFlag
+	wsCert = *wsCertFlag
+	wsKeyFile = *wsKeyFlag
+	wsTLS = *wsTLSFlag
+	if transport == "ws" && *mode == "client" && wsHost == "" {
+		log.Fatal("-transport ws requires -ws-host on the client side")
+	}
+	if transport == "ws" && (wsCert == "") != (wsKeyFile == "") {
+		log.Fatal("-ws-cert and -ws-key must be set together, or neither")
+	}
 	log.Printf("stacktunnel %s starting (%s)", version, *mode)
 	switch *mode {
 	case "tune-server":

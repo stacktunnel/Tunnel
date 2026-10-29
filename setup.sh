@@ -13,6 +13,11 @@ CONF="$CONF_DIR/config.env"
 UNIT="/etc/systemd/system/${SERVICE}.service"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# standalone ws service (see do_add_ws_service) - separate from $SERVICE
+WS_SERVICE="stacktunnel-ws"
+WS_UNIT="/etc/systemd/system/${WS_SERVICE}.service"
+WS_CONF="$CONF_DIR/config-ws.env"
+
 R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[36m'; N=$'\e[0m'
 info() { echo "${B}[i]${N} $*"; }
 ok()   { echo "${G}[OK]${N} $*"; }
@@ -404,6 +409,12 @@ do_status() {
   fi
   echo
   journalctl -u "$SERVICE" -n 10 --no-pager
+  if [[ -f "$WS_UNIT" ]]; then
+    echo
+    echo "${B}--- ${WS_SERVICE} (standalone) ---${N}"
+    systemctl --no-pager status "$WS_SERVICE" | head -n 6
+    journalctl -u "$WS_SERVICE" -n 6 --no-pager
+  fi
 }
 
 # ---------- extra transports ----------
@@ -581,6 +592,171 @@ do_add_transport() {
   fi
 }
 
+# do_remove_transport NAME -- drops NAME from the primary service's
+# -transport list and restarts it. Used to undo do_add_transport (e.g. to
+# move ws out to its own standalone service via do_add_ws_service instead).
+do_remove_transport() {
+  local name="$1" current newlist
+  [[ -f "$UNIT" ]] || { err "Service is not installed."; return 1; }
+  current="$(grep '^ExecStart=' "$UNIT" | grep -oE -- '-transport [^ ]+' | awk '{print $2}')"
+  [[ -z "$current" ]] && current="tcp"
+  if [[ ",${current}," != *",${name},"* ]]; then
+    ok "${name} is not in this service's -transport list (${current}) - nothing to do."
+    return 0
+  fi
+  newlist="$(echo "$current" | tr ',' '\n' | grep -vx "$name" | paste -sd, -)"
+  [[ -z "$newlist" ]] && newlist="tcp"
+  sed -i -E "s|-transport [^ ]+|-transport ${newlist}|" "$UNIT"
+  systemctl daemon-reload
+  systemctl restart "$SERVICE"
+  sleep 2
+  if systemctl is-active --quiet "$SERVICE"; then
+    ok "${SERVICE} is now running with -transport ${newlist}."
+  else
+    err "${SERVICE} failed to start with -transport ${newlist}. Log:"
+    journalctl -u "$SERVICE" -n 20 --no-pager
+    return 1
+  fi
+}
+
+# ---------- standalone ws service ----------
+#
+# do_add_transport (above) merges ws into the SAME process/pool as tcp/udp,
+# so the Go code's own failover picks between them automatically on every
+# forwarded connection - no outside signal needed, but also no way to see
+# or choose which transport a given connection used.
+#
+# This instead sets up ws as a genuinely SEPARATE stacktunnel process, with
+# its OWN exposed port(s), independent of the primary tcp/udp service (no
+# port conflict, since they're different ports; no shared pool, since they
+# don't need one). That lets you wire ws up as its own outbound/inbound in
+# your own panel (e.g. a second x-ui inbound pointed at its port) and switch
+# between them with your panel's own balancer instead of this program's.
+
+do_add_ws_service() {
+  [[ -f "$UNIT" ]] || { err "Install the primary service first (option 1)."; return 1; }
+  [[ -f "$CONF" ]] || { err "No config found - run 'install' first."; return 1; }
+  # shellcheck disable=SC1090
+  source "$CONF"
+
+  echo
+  info "This sets ws up as its OWN standalone service, with its own port(s),"
+  info "fully separate from the ${SERVICE} service (tcp/udp) you already have."
+  info "Point a separate outbound/inbound at it (e.g. a second x-ui inbound on"
+  info "its port) and switch between them yourself - this is independent of"
+  info "the -transport tcp,udp,ws failover from option 10/enable-ws."
+  echo
+
+  if systemctl list-unit-files 2>/dev/null | grep -q "^${WS_SERVICE}.service"; then
+    warn "${WS_SERVICE} is already installed; stopping it to reconfigure."
+    systemctl stop "$WS_SERVICE" 2>/dev/null || true
+  fi
+
+  local ws_role will_dial=false reverse=false
+  ws_role=$(ask "On THIS machine, should ws dial out (d) or listen (l)? [d/l]" \
+    "$([[ "$MODE" == "client" ]] && echo d || echo l)")
+  [[ "$ws_role" == d* ]] && will_dial=true
+  { [[ "$MODE" == "client" && "$will_dial" == false ]] || [[ "$MODE" == "server" && "$will_dial" == true ]]; } && reverse=true
+
+  local ws_path
+  ws_path=$(ask "HTTP path for the WebSocket upgrade" "/tun")
+
+  local tcp_ports udp_ports
+  if [[ "$MODE" == "server" ]]; then
+    echo
+    info "Ports that users connect to for THIS ws path (opened on this server)."
+    tcp_ports="$(ask_ports "TCP ports for ws (e.g. 8890; type 0 for none)" empty)"
+    udp_ports="$(ask_ports "UDP ports for ws (optional; empty = none)" empty)"
+  else
+    echo
+    info "Ports the real service listens on here (127.0.0.1), for THIS ws path."
+    tcp_ports="$(ask_ports "TCP ports (type 0 for none)" empty)"
+    udp_ports="$(ask_ports "UDP ports (optional; empty = none)" empty)"
+  fi
+  if [[ -z "$tcp_ports" && -z "$udp_ports" ]]; then
+    err "At least one TCP or UDP port is required."; return 1
+  fi
+
+  local args="-mode ${MODE} -key ${KEY} -tunnel :0 -transport ws -ws-path ${ws_path}"
+  [[ -n "$tcp_ports" ]] && args+=" -ports ${tcp_ports}"
+  [[ -n "$udp_ports" ]] && args+=" -udp ${udp_ports}"
+  [[ "$reverse" == true ]] && args+=" -ws-reverse=true"
+
+  local ws_host ws_port ws_listen ws_cert ws_key_file
+  if [[ "$will_dial" == true ]]; then
+    ws_host=$(ask "Public hostname to dial (SNI = Host), e.g. myapp-xyz.run.app or api.yourdomain")
+    [[ -z "$ws_host" ]] && { err "A host to dial is required."; return 1; }
+    ws_port=$(ask "Port" 443)
+    args+=" -ws-host ${ws_host} -ws-port ${ws_port}"
+  else
+    local tls_yn
+    echo "Does THIS machine terminate TLS itself, or does something in front of it"
+    echo "(your own nginx, a CDN, a load balancer) already terminate TLS before"
+    echo "forwarding here?"
+    tls_yn=$(ask "Terminate TLS on this machine itself? [y/N]" "n")
+    if [[ "$tls_yn" =~ ^[Yy] ]]; then
+      ws_cert=$(ask "Path to TLS certificate file")
+      ws_key_file=$(ask "Path to TLS private key file")
+      args+=" -ws-cert ${ws_cert} -ws-key ${ws_key_file}"
+    fi
+    ws_listen=$(ask "Local address for the ws listener (nginx/the CDN forwards here)" "127.0.0.1:8081")
+    args+=" -ws-listen ${ws_listen}"
+  fi
+
+  install_binary || return 1
+
+  mkdir -p "$CONF_DIR"; umask 077
+  cat >"$WS_CONF" <<EOF
+MODE=${MODE}
+TCP_PORTS=${tcp_ports}
+UDP_PORTS=${udp_ports}
+WS_REVERSE=${reverse}
+WS_PATH=${ws_path}
+WS_HOST=${ws_host:-}
+WS_PORT=${ws_port:-}
+WS_LISTEN=${ws_listen:-}
+WS_CERT=${ws_cert:-}
+WS_KEY=${ws_key_file:-}
+EOF
+  chmod 600 "$WS_CONF"
+
+  cat >"$WS_UNIT" <<EOF
+[Unit]
+Description=StackTunnel (ws, standalone)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${BIN} ${args}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 600 "$WS_UNIT"
+
+  if [[ "$MODE" == "server" && -n "$tcp_ports$udp_ports" ]]; then
+    open_firewall "$tcp_ports" "$udp_ports" ""
+  fi
+
+  systemctl daemon-reload
+  systemctl enable "$WS_SERVICE" >/dev/null 2>&1
+  systemctl restart "$WS_SERVICE"
+  sleep 2
+
+  if systemctl is-active --quiet "$WS_SERVICE"; then
+    ok "${WS_SERVICE} is running on its own, independent of ${SERVICE}."
+    info "Point a separate outbound/inbound (e.g. a second x-ui inbound) at its port(s) and switch between them yourself."
+  else
+    err "${WS_SERVICE} failed to start. Log:"
+    journalctl -u "$WS_SERVICE" -n 20 --no-pager
+    return 1
+  fi
+}
+
 do_update() {
   if [[ ! -f "$UNIT" ]]; then err "Service is not installed. Run: sudo bash $0 install"; return 1; fi
   warn "Versions are not compatible with each other: update the inside AND outside servers."
@@ -677,7 +853,9 @@ menu() {
   echo "  7) Show config (includes key)"
   echo "  8) Uninstall"
   echo "  9) Add UDP fallback transport (same service, auto-failover)"
-  echo " 10) Add WS/CDN fallback transport (for shutdown periods)"
+  echo " 10) Add WS/CDN fallback transport (same service, auto-failover)"
+  echo " 11) Add WS/CDN as a STANDALONE service (own port, own outbound - you switch)"
+  echo " 12) Remove a transport from the primary service (back to tcp[,udp])"
   echo "  0) Exit"
   case "$(ask "Choice")" in
     1) do_install ;;
@@ -690,23 +868,27 @@ menu() {
     8) do_uninstall ;;
     9) do_add_transport udp ;;
     10) do_add_transport ws ;;
+    11) do_add_ws_service ;;
+    12) do_remove_transport "$(ask "Transport to remove (udp or ws)")" ;;
     *) exit 0 ;;
   esac
 }
 
 need_root
 case "${1:-}" in
-  install)    do_install ;;
-  status)     do_status ;;
-  logs)       journalctl -u "$SERVICE" -f ;;
-  restart)    systemctl restart "$SERVICE" && ok "Restarted." ;;
-  update)     do_update ;;
-  tune)       do_tune ;;
-  window)     do_window "${2:-}" ;;
-  show)       do_show ;;
-  uninstall)  do_uninstall ;;
-  enable-udp) do_add_transport udp ;;
-  enable-ws)  do_add_transport ws ;;
-  "")         menu ;;
-  *)          echo "Usage: bash $0 [install|status|logs|restart|update|tune|window N|show|uninstall|enable-udp|enable-ws]" ;;
+  install)      do_install ;;
+  status)       do_status ;;
+  logs)         journalctl -u "$SERVICE" -f ;;
+  restart)      systemctl restart "$SERVICE" && ok "Restarted." ;;
+  update)       do_update ;;
+  tune)         do_tune ;;
+  window)       do_window "${2:-}" ;;
+  show)         do_show ;;
+  uninstall)    do_uninstall ;;
+  enable-udp)   do_add_transport udp ;;
+  enable-ws)    do_add_transport ws ;;
+  disable-transport) do_remove_transport "${2:-}" ;;
+  add-ws-service)    do_add_ws_service ;;
+  "")           menu ;;
+  *)            echo "Usage: bash $0 [install|status|logs|restart|update|tune|window N|show|uninstall|enable-udp|enable-ws|disable-transport NAME|add-ws-service]" ;;
 esac

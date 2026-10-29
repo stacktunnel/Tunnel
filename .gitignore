@@ -1,1 +1,7 @@
 .idea
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+dist/
+COMMIT_MSG.txt

@@ -5,6 +5,38 @@ a change in the **minor** number (`0.1.x` → `0.2.0`) may break compatibility b
 so update the inside and the outside server together. Patch releases (`0.1.0` → `0.1.1`) are
 compatible with each other.
 
+## [0.4.3]
+
+- `setup.sh` only, no binary change. `add-ws-service` (0.4.2) now takes a
+  name, so you can run SEVERAL standalone ws services at once - one per
+  front/provider (e.g. `arvan`, `aws`, `cloudrun`), each its own
+  `stacktunnel-ws-<name>` unit, own port(s), own `-ws-host`. Previously it
+  always used one fixed service name, so a second run silently overwrote
+  the first.
+- New: `list-ws-services` (menu 13) lists them; `remove-ws-service NAME`
+  (menu 14) removes one.
+- `status` now shows every `stacktunnel-ws-*` service's status/log, not
+  just a single fixed one.
+
+## [0.4.2]
+
+- `setup.sh` only, no binary change. Added a second, independent way to run
+  ws: `add-ws-service` (menu option 11) sets it up as a genuinely standalone
+  `stacktunnel-ws` service, with its own exposed port(s), separate from the
+  primary tcp/udp service - instead of merging into the same process/pool
+  the way `enable-ws` (option 10) does. Point a separate outbound/inbound at
+  its port (e.g. a second x-ui inbound) and switch between them with your
+  own panel's balancer rather than this program's pool/failover. No port
+  conflict with the primary service, since they use different ports, and no
+  shared pool is needed, since nothing here relies on this program's own
+  failover.
+- Added `disable-transport NAME` (menu option 12) to remove a transport
+  from the primary service's `-transport` list (undoes `enable-udp`/
+  `enable-ws`), for switching a transport over to its own standalone service
+  instead, or just dropping it.
+- `status` now also shows `stacktunnel-ws`'s status/log when that standalone
+  service exists.
+
 ## [0.4.1]
 
 - Fix: the ws transport has always assumed -mode client dials and -mode

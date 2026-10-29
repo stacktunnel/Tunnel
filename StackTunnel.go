@@ -759,6 +759,114 @@ func handleTunnel(c net.Conn, psk string, p *pool) {
 	log.Printf("tunnel down from %s after %s", remote, time.Since(start).Round(time.Second))
 }
 
+// dialAsServer is handleTunnel's pool/member logic, but for a connection
+// this side *dials* instead of accepts (used with -ws-reverse on -mode
+// server: this side still exposes ports and owns the pool, but for ws it
+// reaches out through a CDN/front instead of listening - e.g. the Iran
+// server dialing out, the reverse of the usual direction). It keeps
+// redialing with backoff, exactly like runClientSlot, but adds each
+// resulting session to p as a member instead of serving local ports from
+// it - the two sides of the handshake/yamux role stay tied to who actually
+// dialed vs accepted the transport connection (that part is unaffected by
+// -ws-reverse), only which side reads vs writes the hello and what happens
+// to the session afterwards (pool membership vs local forwarding) swaps.
+func dialAsServer(tr, addr, psk string, p *pool, idx int) {
+	label := fmt.Sprintf("%s [%s-reverse] #%d", addr, tr, idx)
+	backoff := time.Second
+	for {
+		start := time.Now()
+		c, err := dialTunnel(tr, addr, psk)
+		if err != nil {
+			logOnce(label+"-dial", "%s: dial failed: %v", label, err)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		tune(c)
+		sc, err := handshake(c, psk, true)
+		if err != nil {
+			logOnce(label+"-hs", "%s: handshake failed: %v", label, err)
+			c.Close()
+			time.Sleep(backoff)
+			continue
+		}
+		sess, err := yamux.Client(sc, yamuxCfg())
+		if err != nil {
+			c.Close()
+			time.Sleep(backoff)
+			continue
+		}
+		timer := time.AfterFunc(10*time.Second, func() { sess.Close() })
+		hs, err := sess.Accept()
+		if err != nil {
+			logOnce(label+"-hello", "%s: no hello from the far end after the handshake: %v", label, err)
+			sess.Close()
+			timer.Stop()
+			time.Sleep(backoff)
+			continue
+		}
+		tcp, udp, err := readHello(hs)
+		hs.Close()
+		timer.Stop()
+		if err != nil {
+			logOnce(label+"-hello", "%s: bad hello: %v", label, err)
+			sess.Close()
+			time.Sleep(backoff)
+			continue
+		}
+		backoff = time.Second
+		m := &member{sess: sess, tcp: tcp, udp: udp}
+		p.add(m)
+		log.Printf("%s: tunnel up: %d tcp / %d udp ports (tcp: %s)", label, len(tcp), len(udp), portSummary(tcp))
+		go junkLoop(sc, sess.CloseChan())
+		<-sess.CloseChan()
+		p.remove(m)
+		log.Printf("%s: tunnel down after %s", label, time.Since(start).Round(time.Second))
+	}
+}
+
+// acceptAsClient is connectSession+serveSession's backend-forwarding logic,
+// but for a connection this side *accepts* instead of dials (used with
+// -ws-reverse on -mode client: this side still forwards to local backend
+// services, but for ws it listens instead of dialing - e.g. behind its own
+// nginx, waiting for the far end, which still owns the exposed ports, to
+// dial in). As with dialAsServer, the handshake/yamux client-vs-server role
+// stays tied to dial-vs-accept (unaffected); only the hello direction and
+// what happens after the session is up (announce+forward, instead of
+// pool membership) swaps.
+func acceptAsClient(c net.Conn, psk string, allowed, allowedUDP map[int]bool, label string) {
+	tune(c)
+	sc, err := handshake(c, psk, false)
+	if err != nil {
+		logOnce(label+"-hs", "%s: handshake failed: %v", label, err)
+		c.Close()
+		return
+	}
+	sess, err := yamux.Server(sc, yamuxCfg())
+	if err != nil {
+		logOnce(label+"-ym", "%s: cannot start session: %v", label, err)
+		c.Close()
+		return
+	}
+	hs, err := sess.Open()
+	if err != nil {
+		sess.Close()
+		return
+	}
+	if err := writeHello(hs, allowed, allowedUDP); err != nil {
+		sess.Close()
+		return
+	}
+	hs.Close()
+	go junkLoop(sc, sess.CloseChan())
+	start := time.Now()
+	log.Printf("%s: tunnel connected", label)
+	err = serveSession(sess, allowed, allowedUDP)
+	log.Printf("%s: tunnel down after %s: %v", label, time.Since(start).Round(time.Second), err)
+}
+
 func serveExposed(port int, p *pool) {
 	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindAddr, port))
 	if err != nil {
@@ -919,7 +1027,7 @@ func serveUDP(port int, p *pool) {
 // the same failover group, and both tried to bind the same exposed user
 // ports and crashed. Running every requested transport inside this one
 // process against this one pool is the fix.
-func runServer(addr, psk string, ports, udpPorts []int) {
+func runServer(addr, psk string, ports, udpPorts []int, conns int) {
 	p := &pool{}
 	for _, port := range ports {
 		go serveExposed(port, p)
@@ -932,11 +1040,26 @@ func runServer(addr, psk string, ports, udpPorts []int) {
 		case "udp":
 			go runServerKCP(addr, psk, p)
 		case "ws":
-			wsAddr := wsListen
-			if wsAddr == "" {
-				wsAddr = addr
+			if wsReverse {
+				// This side still exposes ports and owns the pool, but for
+				// ws it dials out (-ws-host) instead of listening - the
+				// reverse of the usual server direction, for when this side
+				// has the restrictive egress (e.g. the Iran server reaching
+				// a CDN/front). Each dialed session feeds the same pool as
+				// tcp/udp above.
+				for i := 0; i < conns; i++ {
+					go func(i int) {
+						time.Sleep(time.Duration(i) * 300 * time.Millisecond)
+						dialAsServer("ws", wsHost, psk, p, i)
+					}(i)
+				}
+			} else {
+				wsAddr := wsListen
+				if wsAddr == "" {
+					wsAddr = addr
+				}
+				go runServerWS(wsAddr, psk, p)
 			}
-			go runServerWS(wsAddr, psk, p)
 		default:
 			go runServerTCP(addr, psk, p)
 		}
@@ -1144,6 +1267,7 @@ func runServerKCP(addr, psk string, p *pool) {
 // exactly as-is avoids touching proven code for this addition.
 
 var wsHost, wsPath, wsCert, wsKeyFile, wsListen string
+var wsReverse bool
 var wsPort = 443
 var wsTLS = true // client: dial -ws-host over real TLS; set false only if -ws-host is already a plaintext endpoint
 
@@ -1347,6 +1471,29 @@ func dialWS(addr string) (net.Conn, error) {
 //     a provider whose own anycast/edge IPs are expensive for a filter to
 //     block outright.
 func runServerWS(addr, psk string, p *pool) {
+	serveWS(addr, func(c net.Conn) { handleTunnel(c, psk, p) })
+}
+
+// serveWS upgrades requests for wsPath to WebSocket and hands each resulting
+// net.Conn to onConn - handleTunnel (exposer/pool role) in the normal
+// direction, or acceptAsClient (backend role, see -ws-reverse) when this
+// side listens for ws despite being -mode client. Any other path gets a
+// plain 404 so a request that isn't the upgrade doesn't reveal anything.
+//
+// TLS here is optional, not required, because this process does not have
+// to be the public-facing edge. Two shapes are both valid:
+//   - -ws-cert/-ws-key given: this process terminates TLS itself (a real
+//     certificate for -ws-host) and can sit directly on the public internet.
+//   - neither given: this process speaks plain HTTP/WebSocket and is meant
+//     to sit behind something that already terminated TLS before forwarding
+//     here - a CDN edge, a load balancer, or an nginx reverse proxy inside a
+//     managed platform (e.g. Google Cloud Run terminates TLS on its public
+//     *.run.app/custom domain, and an nginx container there forwards the
+//     decrypted WebSocket traffic on to this process over a plain upstream
+//     connection). That is the shape to use when fronting this server with
+//     a provider whose own anycast/edge IPs are expensive for a filter to
+//     block outright.
+func serveWS(addr string, onConn func(net.Conn)) {
 	if (wsCert == "") != (wsKeyFile == "") {
 		log.Fatal("-transport ws: set both -ws-cert and -ws-key, or neither (plain mode, for running behind something that already terminates TLS)")
 	}
@@ -1382,7 +1529,7 @@ func runServerWS(addr, psk string, p *pool) {
 			conn.Close()
 			return
 		}
-		handleTunnel(&wsConn{Conn: conn, isClient: false, br: rw.Reader}, psk, p)
+		onConn(&wsConn{Conn: conn, isClient: false, br: rw.Reader})
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
 
@@ -1584,6 +1731,15 @@ func runClient(addr, psk string, ports, udpPorts []int, conns int, rotate time.D
 	}
 	for _, tr := range transports {
 		if tr == "ws" {
+			if wsReverse {
+				// This side still forwards to local backend services, but
+				// for ws it listens (-ws-listen) instead of dialing - the
+				// far end (still the exposer/pool owner) dials in instead.
+				go serveWS(wsListen, func(c net.Conn) {
+					acceptAsClient(c, psk, allowed, allowedUDP, fmt.Sprintf("ws-reverse from %s", c.RemoteAddr()))
+				})
+				continue
+			}
 			// dialWS ignores addr entirely (it dials -ws-host:-ws-port), so
 			// this doesn't go through the -tunnel target list below.
 			for i := 0; i < conns; i++ {
@@ -1941,6 +2097,7 @@ func main() {
 	wsKeyFlag := flag.String("ws-key", "", "transport=ws server: TLS private key file, paired with -ws-cert")
 	wsTLSFlag := flag.Bool("ws-tls", true, "transport=ws client: dial -ws-host over real TLS (disable only if -ws-host is itself already a plaintext endpoint)")
 	wsListenFlag := flag.String("ws-listen", "", "transport=ws server: address to listen on if different from -tunnel (required when ws is combined with tcp, since both would otherwise try to bind the same TCP address)")
+	wsReverseFlag := flag.Bool("ws-reverse", false, "transport=ws: reverse which side dials for ws only (tcp/udp are unaffected). Normally -mode server listens and -mode client dials; with this set, -mode server DIALS OUT (-ws-host/-ws-port) and -mode client LISTENS (-ws-listen) instead - use when the side that exposes ports has restrictive egress and must reach a CDN/front itself (e.g. the Iran server dials out through Cloud Run/ArvanCloud, and the outside server listens behind its own nginx)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -1997,14 +2154,29 @@ func main() {
 	wsKeyFile = *wsKeyFlag
 	wsTLS = *wsTLSFlag
 	wsListen = *wsListenFlag
-	if hasTransport("ws") && *mode == "client" && wsHost == "" {
-		log.Fatal("-transport ws requires -ws-host on the client side")
+	wsReverse = *wsReverseFlag
+	if hasTransport("ws") {
+		// Normally -mode client dials and -mode server listens, for every
+		// transport including ws. -ws-reverse flips that for ws alone (tcp/udp
+		// keep their normal direction), since the ws fallback's whole point is
+		// to let the side with restrictive egress be the one that dials out
+		// through a CDN/front - which on this project is usually the Iran
+		// server, i.e. -mode server, the side that would otherwise listen.
+		wsDials := (*mode == "client") != wsReverse // XOR
+		if wsDials && wsHost == "" {
+			log.Fatal("-transport ws: this side dials for ws (mode=" + *mode + ", ws-reverse=" + strconv.FormatBool(wsReverse) + "), so -ws-host is required")
+		}
+		if !wsDials {
+			if *mode == "client" && wsListen == "" {
+				log.Fatal("-transport ws -ws-reverse with -mode client: this side listens for ws, so -ws-listen is required (the local address to accept the incoming ws tunnel on, e.g. behind your own nginx)")
+			}
+			if *mode == "server" && hasTransport("tcp") && wsListen == "" {
+				log.Fatal("-transport includes both tcp and ws on the server: set -ws-listen to a different address for the ws listener (they can't both bind the same TCP address)")
+			}
+		}
 	}
 	if hasTransport("ws") && (wsCert == "") != (wsKeyFile == "") {
 		log.Fatal("-ws-cert and -ws-key must be set together, or neither")
-	}
-	if hasTransport("ws") && hasTransport("tcp") && *mode == "server" && wsListen == "" {
-		log.Fatal("-transport includes both tcp and ws on the server: set -ws-listen to a different address for the ws listener (they can't both bind the same TCP address)")
 	}
 	log.Printf("stacktunnel %s starting (%s)", version, *mode)
 	switch *mode {
@@ -2013,7 +2185,7 @@ func main() {
 	case "tune-client":
 		tuneClient(*tun, *key, parseWindows(*windows))
 	case "server":
-		runServer(*tun, *key, parsePorts(*ports), parsePorts(*udp))
+		runServer(*tun, *key, parsePorts(*ports), parsePorts(*udp), *conns)
 	case "client":
 		runClient(*tun, *key, parsePorts(*ports), parsePorts(*udp), *conns, *rotate)
 	default:

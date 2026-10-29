@@ -484,16 +484,31 @@ do_add_transport() {
       echo
       info "ws is a real TLS+WebSocket connection - meant to look like an ordinary"
       info "HTTPS visit, and to sit behind something that already looks like one"
-      info "(a CDN edge, or e.g. nginx inside Google Cloud Run forwarding to this"
-      info "server). This is the transport to use as a shutdown-period fallback."
+      info "(a CDN edge, or e.g. nginx inside Google Cloud Run/ArvanCloud forwarding"
+      info "to this server). This is the transport to use as a shutdown-period"
+      info "fallback - and unlike tcp/udp, which side DIALS and which LISTENS for"
+      info "it is a real choice, not fixed by whether this machine is server/client:"
+      info "whichever side has the restrictive egress (usually the Iran server)"
+      info "should be the one that DIALS OUT through the CDN/front; the other side"
+      info "(usually the kharej/outside server, behind its own nginx) LISTENS."
+      echo
+      local ws_role
+      ws_role=$(ask "On THIS machine, should ws dial out (d) or listen (l)? [d/l]" \
+        "$([[ "$MODE" == "client" ]] && echo d || echo l)")
       local ws_path
       ws_path=$(ask "HTTP path for the WebSocket upgrade" "${WS_PATH:-/}")
       set_unit_flag -ws-path "$ws_path"
       set_conf_var WS_PATH "$ws_path"
-      if [[ "$MODE" == "client" ]]; then
+
+      # ws-reverse is only needed when this role disagrees with what -mode
+      # would normally do on its own (client dials, server listens).
+      local reverse=false
+      { [[ "$MODE" == "client" && "$ws_role" == l* ]] || [[ "$MODE" == "server" && "$ws_role" == d* ]]; } && reverse=true
+
+      if [[ "$ws_role" == d* ]]; then
         local ws_host ws_port
-        ws_host=$(ask "Public hostname to dial (SNI = Host), e.g. myapp-xyz.run.app" "${WS_HOST:-}")
-        [[ -z "$ws_host" ]] && { err "A host is required on the client side."; return 1; }
+        ws_host=$(ask "Public hostname to dial (SNI = Host), e.g. myapp-xyz.run.app or api.yourdomain" "${WS_HOST:-}")
+        [[ -z "$ws_host" ]] && { err "A host to dial is required."; return 1; }
         ws_port=$(ask "Port" "${WS_PORT:-443}")
         set_unit_flag -ws-host "$ws_host"
         set_unit_flag -ws-port "$ws_port"
@@ -501,10 +516,10 @@ do_add_transport() {
         set_conf_var WS_PORT "$ws_port"
       else
         local tls_yn
-        echo "Does THIS server terminate TLS itself, or does something in front of it"
-        echo "(nginx inside Cloud Run, a CDN, a load balancer) already terminate TLS"
-        echo "before forwarding here?"
-        tls_yn=$(ask "Terminate TLS on this server itself? [y/N]" "n")
+        echo "Does THIS machine terminate TLS itself, or does something in front of it"
+        echo "(your own nginx, a CDN, a load balancer) already terminate TLS before"
+        echo "forwarding here?"
+        tls_yn=$(ask "Terminate TLS on this machine itself? [y/N]" "n")
         if [[ "$tls_yn" =~ ^[Yy] ]]; then
           local ws_cert ws_key
           ws_cert=$(ask "Path to TLS certificate file")
@@ -514,13 +529,31 @@ do_add_transport() {
           set_conf_var WS_CERT "$ws_cert"
           set_conf_var WS_KEY "$ws_key"
         fi
-        if [[ ",${current}," == *",tcp,"* ]]; then
+        local listen_default="127.0.0.1:8080"
+        if [[ "$reverse" == true ]]; then
+          # This is a client-mode machine listening for ws (reversed): -tunnel
+          # here is the comma-separated dial target list for tcp/udp, not a
+          # usable listen address, so always ask explicitly.
+          listen_default="127.0.0.1:8081"
+        elif [[ ",${current}," == *",tcp,"* ]]; then
           warn "tcp is also enabled: ws can't bind the same address/port as tcp on this server."
+        fi
+        if [[ "$reverse" == true || ",${current}," == *",tcp,"* ]]; then
           local ws_listen
-          ws_listen=$(ask "Address for the ws listener (a different port)" "127.0.0.1:8080")
+          ws_listen=$(ask "Local address for the ws listener (nginx/the CDN forwards here)" "${WS_LISTEN:-$listen_default}")
           set_unit_flag -ws-listen "$ws_listen"
           set_conf_var WS_LISTEN "$ws_listen"
         fi
+      fi
+
+      if [[ "$reverse" == true ]]; then
+        # -ws-reverse is a bool flag: Go's flag package does NOT consume a
+        # following argument for those, so this must land as one token
+        # ("-ws-reverse=true"), not "-ws-reverse true" via set_unit_flag's
+        # normal space-joined convention (that would leave a stray "true"
+        # token and silently stop parsing anything listed after it).
+        grep -qF -- "-ws-reverse=true" "$UNIT" || sed -i -E "s|^(ExecStart=.*)|\1 -ws-reverse=true|" "$UNIT"
+        set_conf_var WS_REVERSE true
       fi
       ;;
     *)

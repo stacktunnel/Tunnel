@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>StackTunnel Panel</title>
+<style>
+:root{--bg:#0f1115;--card:#171a21;--card2:#1f2430;--line:#2a303c;--fg:#e6e8ee;--mut:#8a93a6;--ok:#2fbf71;--warn:#e0a526;--bad:#e5484d;--acc:#5b8def;--tun:#a970ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 Vazirmatn,Tahoma,system-ui,sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:12px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5;flex-wrap:wrap}
+header h1{font-size:17px;margin:0;white-space:nowrap}
+nav{display:flex;gap:4px;flex-wrap:wrap}
+nav button{border:none;background:none;color:var(--mut);padding:7px 12px;border-radius:8px}
+nav button.on{background:var(--card2);color:var(--fg)}
+.sp{flex:1}
+button,.btn{background:var(--card2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer;font:inherit;font-size:13px}
+button:hover{border-color:var(--acc)}
+button.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+button.dng{color:#ffb3b5}
+button.sm{padding:2px 8px;font-size:12px}
+button:disabled{opacity:.5;cursor:wait}
+input,select,textarea{background:#0f1218;color:var(--fg);border:1px solid var(--line);border-radius:7px;padding:6px 8px;font:inherit;font-size:13px;min-width:0}
+input:focus,select:focus{outline:none;border-color:var(--acc)}
+label{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mut)}
+label .h{font-size:11px;opacity:.8}
+main{padding:16px 20px;display:grid;gap:16px;max-width:1400px;margin:auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.card h2{font-size:15px;margin:0 0 10px;display:flex;align-items:center;gap:8px}
+.card h2 .sp{flex:1}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.diag{border-inline-start:5px solid var(--mut)}
+.diag.ok{border-color:var(--ok)}.diag.warn{border-color:var(--warn)}.diag.bad{border-color:var(--bad)}
+.diag .t{font-weight:700;font-size:15px}
+.diag ul{margin:6px 0 0;padding-inline-start:18px;color:var(--mut)}
+.nodes{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px}
+.node .hd{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--mut);flex:none;display:inline-block}
+.dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}.dot.warn{background:var(--warn)}
+.tag{font-size:11px;padding:1px 7px;border-radius:99px;border:1px solid var(--line);color:var(--mut);white-space:nowrap}
+.mut{color:var(--mut)}.small{font-size:12px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:12px}
+.pill{display:inline-flex;align-items:center;gap:4px;font-size:12px;margin:2px;padding:1px 8px;border-radius:6px;background:var(--card2);direction:ltr}
+.pill.bad{background:#3a1d20;color:#ffb3b5}.pill.ok{background:#173326;color:#a6f0c6}.pill.udp{background:#2a2140;color:#d6c2ff}
+.pill .x{cursor:pointer;opacity:.6}.pill .x:hover{opacity:1;color:var(--bad)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:start;vertical-align:top}
+th{color:var(--mut);font-weight:500;white-space:nowrap}
+td.c{text-align:center}
+.ltr{direction:ltr;unicode-bidi:embed}
+.nw{white-space:nowrap}
+#topo{width:100%;overflow-x:auto}
+#topo svg{direction:ltr;display:block;margin:auto}
+.cell-ok{color:var(--ok)}.cell-bad{color:var(--bad)}.cell-warn{color:var(--warn)}
+details summary{cursor:pointer;color:var(--mut);font-size:12px}
+.err{color:#ffb3b5;font-size:12px}
+.okmsg{color:#a6f0c6;font-size:12px}
+pre{background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;max-height:420px;font-size:12px;direction:ltr;text-align:left;white-space:pre-wrap;word-break:break-all;margin:6px 0}
+pre .a{color:#7ee2a8}pre .d{color:#ff9ea1}pre .h{color:var(--mut)}
+#modal{position:fixed;inset:0;background:#000a;display:none;align-items:flex-start;justify-content:center;z-index:20;overflow:auto;padding:40px 12px}
+#modal .box{background:var(--card);border:1px solid var(--line);border-radius:14px;max-width:900px;width:100%;padding:18px}
+#modal h3{margin:0 0 10px;font-size:16px}
+.warnbox{background:#3a2e10;border:1px solid #6b5212;color:#ffd98a;border-radius:8px;padding:8px 10px;font-size:12.5px;margin:6px 0}
+.hide{display:none!important}
+.bar{height:8px;background:var(--card2);border-radius:4px;overflow:hidden;min-width:80px}
+.bar i{display:block;height:100%;background:var(--acc)}
+</style>
+</head>
+<body>
+<header>
+  <h1>🛰 StackTunnel Panel</h1><span class="tag" id="ver"></span>
+  <nav id="nav">
+    <button data-t="dash" class="on">داشبورد</button>
+    <button data-t="tun">تانل‌ها و پورت‌ها</button>
+    <button data-t="srv">سرورها</button>
+    <button data-t="speed">تست سرعت</button>
+    <button data-t="tune">بهترین تنظیمات</button>
+    <button data-t="set">تنظیمات</button>
+  </nav>
+  <span class="sp"></span>
+  <span class="mut small" id="upd"></span>
+  <button onclick="refreshNow(this)">بروزرسانی</button>
+</header>
+
+<main>
+<!-- DASHBOARD -->
+<section data-p="dash" class="tab">
+  <div class="card diag" id="diag"></div>
+  <div class="card" style="margin-top:16px"><h2>چی به چی وصله</h2><div id="topo"></div>
+    <div class="mut small">خط سبز = اتصال فعال (برنامه → برنامه:پورت ×تعداد) · بنفش = اینترفیس تانل · آبی = کاربرها</div></div>
+  <div class="card" style="margin-top:16px"><h2>دسترسی‌پذیری (هر سطر: از این سرور ← به ستون)</h2><div id="matrix" style="overflow-x:auto"></div></div>
+</section>
+
+<!-- TUNNELS -->
+<section data-p="tun" class="tab hide">
+  <div class="card"><h2>تانل‌ها (خارج ↔ ایران)<span class="sp"></span><button class="pri" onclick="newTunnelForm()">+ تانل جدید</button></h2>
+    <div class="mut small" style="margin-bottom:8px">پورت را برای هر سرور خارج اضافه/حذف کنید؛ پنل همان پورت را روی سرویس سمت ایران هم هماهنگ می‌کند. قبل از اعمال، تغییرات را می‌بینید.</div>
+    <div id="pairs" style="overflow-x:auto"></div>
+  </div>
+  <div class="card hide" id="newtun"></div>
+  <div class="card"><h2>همه‌ی سرویس‌های stacktunnel</h2><div id="units" style="overflow-x:auto"></div></div>
+</section>
+
+<!-- SERVERS -->
+<section data-p="srv" class="tab hide">
+  <div class="nodes" id="nodes"></div>
+  <div class="card" style="margin-top:16px"><h2>افزودن سرور</h2>
+    <details><summary>اول روی سرور جدید agent را نصب کنید (کلیک کنید)</summary>
+      <pre id="installhelp"></pre></details>
+    <div class="grid" style="margin-top:10px">
+      <label>نام<input id="n_name" placeholder="hetzner1"></label>
+      <label>نقش<select id="n_role"><option value="kharej">خارج</option><option value="iran">ایران</option></select></label>
+      <label>آدرس agent<input id="n_host" class="ltr" placeholder="1.2.3.4"></label>
+      <label>پورت agent<input id="n_port" class="ltr" value="9555"></label>
+      <label>IP عمومی <span class="h">(اگر با آدرس فرق دارد)</span><input id="n_ip" class="ltr"></label>
+      <label>پورت‌های تست<input id="n_probe" class="ltr" value="443"></label>
+      <label style="grid-column:span 2">token<input id="n_token" class="ltr"></label>
+      <label style="grid-column:span 2">fingerprint<input id="n_fp" class="ltr"></label>
+      <label style="grid-column:1/-1">یادداشت<input id="n_note" placeholder="Hetzner FSN - backhaul"></label>
+    </div>
+    <div class="row" style="margin-top:10px"><button class="pri" onclick="addNode(this)">ذخیره و تست اتصال</button><span id="n_msg"></span></div>
+  </div>
+</section>
+
+<!-- SPEED -->
+<section data-p="speed" class="tab hide">
+  <div class="card"><h2>تست سرعت</h2>
+    <div class="grid">
+      <label>سرور خارج<select id="sp_node" onchange="spFill()"></select></label>
+      <label>نوع تست<select id="sp_mode" onchange="spFill()">
+        <option value="tunnel">از داخل تانل (stacktunnel)</option>
+        <option value="down">مستقیم: دانلود خارج ← ایران</option>
+        <option value="up">مستقیم: آپلود ایران ← خارج</option></select></label>
+      <label id="sp_portl">پورت تانل<select id="sp_port"></select><span class="h">پورتی از تانل که پشتش روی سرور خارج سرویسی نیست</span></label>
+      <label>حجم (MB)<select id="sp_mb"><option>1</option><option selected>10</option><option>50</option></select></label>
+    </div>
+    <div class="row" style="margin-top:10px"><button class="pri" onclick="runSpeed(this)">شروع تست</button><span id="sp_msg" class="small"></span></div>
+    <div class="mut small" style="margin-top:8px">«مستقیم» مسیر خام بین دو سرور را می‌سنجد؛ «از داخل تانل» همان مسیری است که کاربرها استفاده می‌کنند. اگر فقط چند ده KB برسد و بقیه نرسد، یعنی مسیر بعد از حجم کم قطع می‌شود.</div>
+  </div>
+  <div class="card"><h2>نتیجه‌ها</h2><div id="sp_hist" style="overflow-x:auto"></div></div>
+</section>
+
+<!-- TUNE -->
+<section data-p="tune" class="tab hide">
+  <div class="card"><h2>پیدا کردن بهترین تنظیمات</h2>
+    <div class="mut small" style="margin-bottom:10px">پنل یک تانل تستی جدا (stacktunnel-tune) بین ایران و سرور انتخابی می‌سازد، هر ترکیب conns × window × transport را امتحان می‌کند و سرعت را از داخل همان تانل می‌سنجد. تانل‌های اصلی و کاربرها دست نمی‌خورند؛ آخر کار تانل تست پاک می‌شود.</div>
+    <div class="grid">
+      <label>سرور خارج<select id="tu_node"></select></label>
+      <label>تعداد اتصال (conns)<input id="tu_conns" class="ltr" value="2,4,8"><span class="h">با کاما</span></label>
+      <label>window (KB)<input id="tu_win" class="ltr" value="256,1024,4096"><span class="h">با کاما</span></label>
+      <label>transport<span class="row" style="color:var(--fg)"><label class="row" style="flex-direction:row"><input type="checkbox" id="tu_tcp" checked> tcp</label><label class="row" style="flex-direction:row"><input type="checkbox" id="tu_udp"> udp</label></span></label>
+      <label>حجم هر تست (MB)<select id="tu_mb"><option>5</option><option selected>10</option><option>20</option></select></label>
+      <label>تکرار هر ترکیب<select id="tu_rep"><option>1</option><option selected>2</option><option>3</option></select></label>
+      <label>جریان موازی<select id="tu_str"><option>1</option><option selected>4</option><option>8</option></select><span class="h">مثل تست خود stacktunnel: ۴</span></label>
+    </div>
+    <details style="margin-top:8px"><summary>پیشرفته</summary><div class="grid" style="margin-top:8px">
+      <label>پورت تانل تست (روی ایران)<input id="tu_tport" class="ltr" value="4900"></label>
+      <label>پورت داده‌ی تست<input id="tu_dport" class="ltr" value="9557"><span class="h">باید روی ایران و خارج آزاد باشد</span></label>
+      <label>padding<input id="tu_pad" class="ltr" value="128"></label></div></details>
+    <div class="row" style="margin-top:10px"><button class="pri" id="tu_start" onclick="tuneStart(this)">شروع تست</button>
+      <button id="tu_cancel" class="dng hide" onclick="tuneCancel()">توقف</button><span id="tu_msg" class="small"></span></div>
+    <div id="tu_prog" style="margin-top:10px"></div>
+  </div>
+  <div class="card"><h2>نتیجه‌ها <span class="mut small" id="tu_meta"></span></h2><div id="tu_res" style="overflow-x:auto"></div>
+    <details style="margin-top:8px"><summary>لاگ</summary><pre id="tu_log"></pre></details></div>
+</section>
+
+<!-- SETTINGS -->
+<section data-p="set" class="tab hide">
+  <div class="card"><h2>تنظیمات پنل</h2>
+    <div class="grid">
+      <label>فاصله‌ی بروزرسانی (ثانیه)<input id="s_int" class="ltr"></label>
+      <label style="grid-column:span 2">آدرس‌های تست اینترنت (با کاما)<input id="s_urls" class="ltr"></label>
+      <label>رمز پنل <span class="h">(خالی = بدون تغییر)</span><input id="s_pw" type="password"></label>
+      <label>SNI اتصال به agentها<input id="s_sni" class="ltr"><span class="h">بدون SNI بعضی مسیرها reset می‌شوند</span></label>
+    </div>
+    <div class="row" style="margin-top:10px"><button class="pri" onclick="saveSettings(this)">ذخیره</button><span id="s_msg" class="small"></span></div>
+    <div class="mut small" style="margin-top:8px" id="s_info"></div>
+  </div>
+</section>
+</main>
+
+<div id="modal"><div class="box" id="mbox"></div></div>
+
+<script>
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtB=b=>{if(b==null)return'-';const u=['B','KB','MB','GB','TB'];let i=0;while(b>=1024&&i<4){b/=1024;i++}return b.toFixed(i?1:0)+' '+u[i]};
+const ago=t=>{if(!t)return'هرگز';const s=Math.round(Date.now()/1000-t);return s<60?s+' ثانیه پیش':s<3600?Math.round(s/60)+' دقیقه پیش':Math.round(s/3600)+' ساعت پیش'};
+const dur=s=>s==null?'-':s<3600?Math.round(s/60)+'m':s<86400?Math.round(s/3600)+'h':Math.round(s/86400)+'d';
+const aget=(args,f,d='')=>{const x=(args||[]).find(a=>a[0]===f);return x?x[1]:d};
+let S=null, TAB='dash', busyUI=false;
+
+async function post(path,body){
+  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  let j={};try{j=await r.json()}catch(e){}
+  if(!r.ok||j.ok===false&&j.error)throw new Error(j.error||('HTTP '+r.status));
+  return j;
+}
+async function withBtn(btn,fn){if(btn)btn.disabled=true;try{return await fn()}finally{if(btn)btn.disabled=false}}
+async function load(){try{const r=await fetch('api/state');S=await r.json();render()}catch(e){$('#upd').textContent='خطا در اتصال به پنل'}}
+async function refreshNow(b){await withBtn(b,async()=>{await post('api/refresh');await new Promise(r=>setTimeout(r,4000));await load()})}
+
+$$('#nav button').forEach(b=>b.onclick=()=>{TAB=b.dataset.t;$$('#nav button').forEach(x=>x.classList.toggle('on',x===b));$$('.tab').forEach(s=>s.classList.toggle('hide',s.dataset.p!==TAB));render()});
+
+function status(n){if(n.ok)return'ok';if(n.stale)return'warn';return'bad'}
+function nd(n){return n.data||n.stale||{}}
+function nodeByName(name){return S.nodes.find(n=>n.name===name)}
+
+function render(){
+  if(!S)return;
+  $('#ver').textContent='v'+S.version;
+  $('#upd').textContent='آخرین دور: '+ago(S.updated);
+  if(TAB==='dash'){renderDiag();renderTopo();renderMatrix()}
+  const ae=document.activeElement, typing=ae&&['INPUT','SELECT','TEXTAREA'].includes(ae.tagName)&&ae.value!=='';
+  if(TAB==='tun'&&!busyUI&&!typing){renderPairs();renderUnits()}
+  if(TAB==='srv'&&!busyUI&&!typing){renderNodes()}
+  if(TAB==='speed'){renderSpeedForm();renderSpeedHist()}
+  if(TAB==='tune'){renderTune()}
+  if(TAB==='set'&&!busyUI){renderSettings()}
+}
+
+/* ---------- dashboard ---------- */
+function renderDiag(){
+  const d=S.diagnosis;
+  $('#diag').className='card diag '+d.level;
+  $('#diag').innerHTML=`<div class="t">${esc(d.title)}</div>`+
+    (d.google||d.arvan?`<div class="small mut">گوگل از ایران: ${d.google&&d.google.ok?'✅':'❌'} · آروان از ایران: ${d.arvan&&d.arvan.ok?'✅':'❌'}</div>`:'')+
+    (d.lines.length?'<ul>'+d.lines.map(l=>`<li>${esc(l)}</li>`).join('')+'</ul>':'');
+}
+function renderTopo(){
+  const iran=S.nodes.filter(n=>n.role==='iran'),kh=S.nodes.filter(n=>n.role!=='iran');
+  const W=1080,BW=180,BH=58,gap=78;
+  const rows=Math.max(iran.length,kh.length,2);const H=Math.max(260,rows*gap+60);
+  const pos={};
+  const place=(arr,x)=>arr.forEach((n,i)=>pos[n.name]={x,y:(H-(arr.length-1)*gap)/2+i*gap});
+  place(iran,330);place(kh,700);
+  const usersN=S.ext_in.reduce((a,x)=>a+x.ips,0);
+  pos.__users={x:90,y:H/2};pos.__net={x:990,y:H/2};
+  let svg=`<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="Tahoma,sans-serif" font-size="11">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8a93a6"/></marker></defs>`;
+  const curve=(a,b,off)=>{const x1=a.x+(b.x>a.x?BW/2:-BW/2),x2=b.x+(b.x>a.x?-BW/2:BW/2),y1=a.y+off,y2=b.y+off;const mx=(x1+x2)/2;return{d:`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`,lx:mx,ly:(y1+y2)/2}};
+  const groups={};S.edges.forEach(e=>{const k=[e.from,e.to].sort().join('|');(groups[k]=groups[k]||[]).push(e)});
+  for(const k in groups){groups[k].forEach((e,i,arr)=>{
+    const a=pos[e.from],b=pos[e.to];if(!a||!b)return;
+    const off=(i-(arr.length-1)/2)*14;const c=curve(a,b,off);
+    const tun=e.kind!=='conn';const col=e.kind==='tunnel-dead'?'#e5484d':tun?'#a970ff':'#2fbf71';
+    svg+=`<path d="${c.d}" fill="none" stroke="${col}" stroke-width="${tun?2:Math.min(1.5+Math.log2(e.n+1),5)}" ${tun?'stroke-dasharray="6 4"':''} ${tun?'':'marker-end="url(#ar)"'} opacity=".9"/>`;
+    const lbl=tun?`${e.proto} ${e.port}`:`${e.cproc||'?'} → ${e.sproc||'?'}:${e.port} ×${e.n}`;
+    svg+=`<text x="${c.lx}" y="${c.ly-4}" text-anchor="middle" fill="${col}" paint-order="stroke" stroke="#171a21" stroke-width="4">${esc(lbl)}</text>`;
+  })}
+  const inBy={};S.ext_in.forEach(x=>inBy[x.node]=(inBy[x.node]||0)+x.ips);
+  for(const n in inBy){const b=pos[n];if(!b)continue;const c=curve(pos.__users,b,0);
+    svg+=`<path d="${c.d}" fill="none" stroke="#5b8def" stroke-width="1.5" marker-end="url(#ar)" opacity=".7"/><text x="${c.lx}" y="${c.ly-4}" text-anchor="middle" fill="#5b8def">${inBy[n]} IP</text>`}
+  const outBy={};S.ext_out.forEach(x=>outBy[x.node]=(outBy[x.node]||0)+x.n);
+  for(const n in outBy){const a=pos[n];if(!a)continue;const c=curve(a,pos.__net,0);
+    svg+=`<path d="${c.d}" fill="none" stroke="#8a93a6" stroke-width="1.2" marker-end="url(#ar)" opacity=".5"/>`}
+  const box=(p,title,sub,col)=>`<g><rect x="${p.x-BW/2}" y="${p.y-BH/2}" width="${BW}" height="${BH}" rx="10" fill="#1f2430" stroke="${col}" stroke-width="2"/>
+    <text x="${p.x}" y="${p.y-4}" text-anchor="middle" fill="#e6e8ee" font-size="13" font-weight="700">${esc(title)}</text>
+    <text x="${p.x}" y="${p.y+14}" text-anchor="middle" fill="#8a93a6">${esc(sub)}</text></g>`;
+  const colr={ok:'#2fbf71',warn:'#e0a526',bad:'#e5484d'};
+  S.nodes.forEach(n=>{svg+=box(pos[n.name],n.name,(n.role==='iran'?'🇮🇷 ':'🌍 ')+(n.ip||n.host),colr[status(n)])});
+  svg+=box(pos.__users,'کاربرها',usersN+' IP یکتا','#5b8def');
+  svg+=box(pos.__net,'اینترنت / CDN','مقصدهای بیرونی','#8a93a6');
+  $('#topo').innerHTML=svg+'</svg>';
+}
+function renderMatrix(){
+  const names=S.nodes.map(n=>n.name);
+  let h='<table><tr><th>از \\ به</th>'+names.map(n=>`<th>${esc(n)}</th>`).join('')+'<th>گوگل</th><th>آروان</th></tr>';
+  S.nodes.forEach(src=>{
+    const d=src.data||{};const urls=(d.probes||{}).urls||{};
+    h+=`<tr><th>${esc(src.name)}</th>`+names.map(dst=>{
+      if(dst===src.name)return'<td class="c mut">·</td>';
+      const p=(S.matrix[src.name]||{})[dst];if(!p)return'<td class="c mut">?</td>';
+      const ports=Object.entries(p.tcp).map(([pt,ms])=>`<span class="${ms==null?'cell-bad':'cell-ok'}">${pt}${ms==null?'✗':':'+Math.round(ms)}</span>`).join(' ');
+      const pg=p.ping_ok?`<span class="cell-ok">ping ${p.ping_ms?Math.round(p.ping_ms)+'ms':''}</span>`:'<span class="cell-bad">ping✗</span>';
+      return `<td class="c ltr small">${pg}<br>${ports}</td>`}).join('')+
+      ['google','arvan'].map(k=>{const v=Object.entries(urls).find(([u])=>u.includes(k));if(!v)return'<td class="c mut">?</td>';
+        return `<td class="c">${v[1].ok?'<span class="cell-ok">✓</span>':'<span class="cell-bad">✗</span>'}</td>`}).join('')+'</tr>'});
+  $('#matrix').innerHTML=h+'</table>';
+}
+
+/* ---------- tunnels ---------- */
+const stDot=s=>`<span class="dot ${s==='active'?'ok':s?'bad':''}" title="${esc(s||'?')}"></span>`;
+function renderPairs(){
+  const P=S.pairs.pairs;
+  if(!P.length){$('#pairs').innerHTML='<div class="mut small">هیچ کلاینت stacktunnel روی سرورهای خارجِ ثبت‌شده پیدا نشد.</div>';return}
+  $('#pairs').innerHTML='<table><tr><th>سرور خارج</th><th>سرویس</th><th>سمت ایران</th><th>transport</th><th>پورت‌های TCP</th><th>پورت‌های UDP</th><th></th></tr>'+P.map((p,i)=>`<tr>
+    <td class="nw">${stDot(p.client_state)} <b>${esc(p.client_node)}</b></td>
+    <td class="ltr nw">${esc(p.client_unit)}</td>
+    <td class="nw">${p.server_unit?`${stDot(p.server_state)} ${esc(p.server_node)} <span class="ltr mut">${esc(p.server_unit)}</span>`:'<span class="cell-warn">پیدا نشد</span>'}<div class="mut small ltr">${esc(p.tunnel)}</div></td>
+    <td class="ltr">${esc(p.transport)}</td>
+    <td>${p.tcp.map(x=>`<span class="pill">${x}<span class="x" title="حذف" onclick="portOp('${p.client_node}','${p.client_unit}','tcp',${x},'remove')">✕</span></span>`).join('')||'<span class="mut">—</span>'}</td>
+    <td>${p.udp.map(x=>`<span class="pill udp">${x}<span class="x" title="حذف" onclick="portOp('${p.client_node}','${p.client_unit}','udp',${x},'remove')">✕</span></span>`).join('')||'<span class="mut">—</span>'}</td>
+    <td class="nw"><select id="pp_proto_${i}"><option>tcp</option><option>udp</option></select>
+      <input id="pp_port_${i}" class="ltr" style="width:80px" placeholder="پورت">
+      <button class="sm pri" onclick="portOp('${p.client_node}','${p.client_unit}',$('#pp_proto_${i}').value,$('#pp_port_${i}').value,'add')">+ پورت</button></td>
+  </tr>`).join('')+'</table>';
+}
+function renderUnits(){
+  let rows='';
+  S.nodes.forEach(n=>{(nd(n).units||[]).forEach(u=>{
+    const a=u.args, st=u.state||{};
+    rows+=`<tr><td class="nw">${stDot(st.ActiveState)} <b>${esc(n.name)}</b></td><td class="ltr nw">${esc(u.name)}</td>
+      <td>${esc(aget(a,'mode'))}</td><td class="ltr">${esc(aget(a,'tunnel'))}</td><td class="ltr">${esc(aget(a,'transport','tcp'))}</td>
+      <td class="ltr small">${esc(aget(a,'ports'))}${aget(a,'udp')?' · udp '+esc(aget(a,'udp')):''}</td>
+      <td class="small">${esc(st.ActiveState||'?')}/${esc(st.SubState||'')}${+st.NRestarts>0?` <span class="cell-warn">↻${st.NRestarts}</span>`:''}</td>
+      <td class="nw"><button class="sm" onclick="editUnit('${n.name}','${u.name}')">ویرایش</button>
+        <button class="sm" onclick="unitAct('${n.name}','${u.name}','restart')">ری‌استارت</button>
+        ${st.ActiveState==='active'?`<button class="sm" onclick="unitAct('${n.name}','${u.name}','stop')">توقف</button>`:`<button class="sm" onclick="unitAct('${n.name}','${u.name}','start')">شروع</button>`}
+        <button class="sm" onclick="showLogs('${n.name}','${u.name}')">لاگ</button>
+        <button class="sm dng" onclick="delUnit('${n.name}','${u.name}')">حذف</button></td></tr>`})});
+  $('#units').innerHTML=rows?'<table><tr><th>سرور</th><th>سرویس</th><th>mode</th><th>tunnel</th><th>transport</th><th>پورت‌ها</th><th>وضعیت</th><th></th></tr>'+rows+'</table>':'<div class="mut small">سرویسی پیدا نشد.</div>';
+}
+
+/* modal */
+function modal(html){$('#mbox').innerHTML=html;$('#modal').style.display='flex'}
+function closeModal(){$('#modal').style.display='none';busyUI=false;render()}
+$('#modal').onclick=e=>{if(e.target.id==='modal')closeModal()};
+function diffHtml(d){if(!d)return'<span class="mut">بدون تغییر</span>';return'<pre>'+esc(d).split('\n').map(l=>l.startsWith('+')&&!l.startsWith('+++')?`<span class="a">${l}</span>`:l.startsWith('-')&&!l.startsWith('---')?`<span class="d">${l}</span>`:l.startsWith('@@')?`<span class="h">${l}</span>`:l).join('\n')+'</pre>'}
+
+let PLAN=null;
+function showPlan(title,p){
+  PLAN=p;busyUI=true;
+  modal(`<h3>${esc(title)}</h3>`+(p.warnings||[]).map(w=>`<div class="warnbox">⚠ ${esc(w)}</div>`).join('')+
+    p.changes.map(c=>`<div style="margin-top:10px"><b>${esc(c.node)}</b> · <span class="ltr">${esc(c.name)}.service</span> ${c.exists===false?'<span class="tag">جدید</span>':''}${diffHtml(c.diff)}</div>`).join('')+
+    `<div class="row" style="margin-top:12px"><button class="pri" id="applyBtn" onclick="applyPlan(this)">اعمال تغییرات</button><button onclick="closeModal()">انصراف</button><span id="applyMsg" class="small"></span></div>
+     <div class="mut small" style="margin-top:6px">از نسخه‌ی فعلی بکاپ گرفته می‌شود. اگر سرویس بعد از تغییر بالا نیاید، خودکار به نسخه‌ی قبل برمی‌گردد.</div>`);
+}
+async function applyPlan(b){
+  $('#applyMsg').textContent='در حال اعمال… (هر سرویس ~۵ ثانیه)';
+  await withBtn(b,async()=>{
+    try{const r=await post('api/apply',{changes:PLAN.changes});
+      $('#applyMsg').innerHTML=r.ok?'<span class="okmsg">✅ انجام شد</span>':'<span class="err">❌ انجام نشد؛ تغییرات برگردانده شد</span>';
+      $('#mbox').insertAdjacentHTML('beforeend',r.results.map(x=>`<div class="small ${x.ok?'okmsg':'err'}">${x.ok?'✓':'✗'} ${esc(x.node)} ${esc(x.name)} ${x.undone?'(برگردانده شد)':''} ${esc(x.error||x.undo_error||'')}</div>${x.logs?'<pre>'+esc(x.logs)+'</pre>':''}`).join(''));
+      b.classList.add('hide');await load();
+    }catch(e){$('#applyMsg').innerHTML=`<span class="err">${esc(e.message)}</span>`}
+  });
+}
+async function portOp(node,unit,proto,port,op){
+  port=String(port).trim();if(!/^\d+$/.test(port))return alert('پورت را وارد کنید');
+  if(op==='remove'&&!confirm(`پورت ${proto}/${port} از ${node} حذف شود؟`))return;
+  busyUI=true;modal('<div class="mut">در حال آماده کردن تغییرات…</div>');
+  try{const p=await post('api/port/plan',{node,unit,proto,port:+port,op});showPlan(`${op==='add'?'افزودن':'حذف'} پورت ${proto}/${port} — ${node}`,p)}
+  catch(e){modal(`<div class="err">${esc(e.message)}</div><button onclick="closeModal()">بستن</button>`)}
+}
+async function unitAct(node,name,action){
+  const fa={restart:'ری‌استارت',stop:'توقف',start:'شروع'}[action];
+  if(!confirm(`${fa} ${name} روی ${node}؟ کاربرهای این سرویس ${action==='start'?'وصل':'قطع'} می‌شوند.`))return;
+  try{const r=await post('api/unit/action',{node,name,action});alert(r.ok?`انجام شد: ${r.state.ActiveState}`:'خطا: '+r.out);load()}catch(e){alert(e.message)}
+}
+async function delUnit(node,name){
+  if(!confirm(`سرویس ${name} روی ${node} متوقف و حذف شود؟ (بکاپ نگه داشته می‌شود)`))return;
+  if(prompt('برای تأیید، نام سرویس را بنویسید:')!==name)return;
+  try{await post('api/unit/delete',{node,name});load()}catch(e){alert(e.message)}
+}
+async function showLogs(node,name){
+  busyUI=true;modal(`<h3>لاگ ${esc(name)} — ${esc(node)}</h3><pre id="logbox">…</pre><div class="row"><button onclick="showLogs('${node}','${name}')">تازه کردن</button><button onclick="closeModal()">بستن</button></div>`);
+  try{const r=await post('api/unit/logs',{node,name,n:150});$('#logbox').textContent=r.logs||'(خالی)';$('#logbox').scrollTop=1e9}catch(e){$('#logbox').textContent=e.message}
+}
+
+/* edit form */
+const FL=[
+ ['mode','حالت','sel:server,client','server = ایران، client = خارج'],
+ ['tunnel','آدرس تانل','txt','سرور: ‎:4000 — کلاینت: IP_ایران:4000'],
+ ['key','کلید','txt','باید روی دو طرف یکی باشد'],
+ ['transport','transport','txt','tcp, udp, ws یا ترکیب با کاما (مثلاً tcp,udp)'],
+ ['ports','پورت‌های TCP','txt','با کاما'],
+ ['udp','پورت‌های UDP','txt','با کاما'],
+ ['pad','padding','num','0..4096 بایت (پیش‌فرض 128)'],
+ ['conns','تعداد اتصال (کلاینت)','num','پیش‌فرض 4'],
+ ['rotate','چرخش اتصال (کلاینت)','txt','مثل 5m؛ 0 = خاموش'],
+ ['retire-timeout','مهلت اتصال قدیمی','txt','پیش‌فرض 20m'],
+ ['window','window (KB)','num','256 برای لینک ضعیف، تا 8192 برای سریع'],
+ ['windows','windows (tune)','txt','256,1024,4096,8192'],
+ ['fec-data','FEC data (udp)','num','پیش‌فرض 10'],
+ ['fec-parity','FEC parity (udp)','num','0 = خاموش، پیش‌فرض 3'],
+ ['junk','پکت فریب','txt','مثلاً 20s؛ 0 = خاموش'],
+ ['fragment','fragment','bool','تصادفی کردن اندازه‌ی فریم‌ها'],
+ ['bind','bind (سرور)','txt','IP که پورت‌های کاربر روی آن باز می‌شوند'],
+ ['source-ips','source IPs (کلاینت)','txt','چند IP محلی با کاما'],
+ ['ws-host','ws host','txt','دامنه (SNI/Host)'],
+ ['ws-port','ws port','num','پیش‌فرض 443'],
+ ['ws-path','ws path','txt','مثل /tun'],
+ ['ws-listen','ws listen','txt','وقتی ws با tcp ترکیب شده'],
+ ['ws-reverse','ws reverse','bool','سمت ایران به CDN وصل شود'],
+ ['ws-tls','ws tls','bool','پیش‌فرض true'],
+ ['ws-cert','ws cert','txt','مسیر فایل'],
+ ['ws-key','ws key','txt','مسیر فایل'],
+];
+let EDIT=null;
+function unitForm(u){
+  const a=u.args||[];
+  return `<div class="grid">`+FL.map(([f,l,t,h])=>{
+    const v=aget(a,f,'');let inp;
+    if(t.startsWith('sel:'))inp=`<select data-f="${f}">${t.slice(4).split(',').map(o=>`<option ${o===v?'selected':''}>${o}</option>`).join('')}</select>`;
+    else if(t==='bool')inp=`<select data-f="${f}"><option value="" ${v===''?'selected':''}>پیش‌فرض</option><option ${v==='true'?'selected':''}>true</option><option ${v==='false'?'selected':''}>false</option></select>`;
+    else inp=`<input data-f="${f}" class="ltr" value="${esc(v)}">`;
+    return `<label>${l}${inp}<span class="h">${h}</span></label>`}).join('')+`</div>`;
+}
+function readForm(root){
+  // keep the unit's original flag order so the diff shows only real changes
+  const vals={};root.querySelectorAll('[data-f]').forEach(el=>{vals[el.dataset.f]=el.value.trim()});
+  const args=[],used=new Set();
+  (EDIT&&EDIT.args||[]).forEach(([f,v])=>{if(f==='_')return;used.add(f);
+    if(f in vals){if(vals[f]!=='')args.push([f,vals[f]])}else args.push([f,v])});
+  FL.forEach(([f])=>{if(!used.has(f)&&vals[f])args.push([f,vals[f]])});
+  return args;
+}
+async function editUnit(node,name){
+  busyUI=true;modal('<div class="mut">در حال خواندن…</div>');
+  try{const u=await post('api/unit/get',{node,name});EDIT=u;
+    modal(`<h3>ویرایش ${esc(name)} — ${esc(node)}</h3>
+      <label>توضیح<input id="e_desc" value="${esc(u.description)}"></label><div style="height:8px"></div>
+      <div id="e_form">${unitForm(u)}</div>
+      <details style="margin-top:8px"><summary>دستور فعلی</summary><pre>${esc(u.exec)}</pre></details>
+      ${(u.backups||[]).length?`<details><summary>بکاپ‌ها (${u.backups.length})</summary>${u.backups.map(b=>`<div class="row small ltr">${esc(b)} <button class="sm" onclick="restoreB('${node}','${name}','${b}')">بازگردانی</button></div>`).join('')}</details>`:''}
+      <div class="row" style="margin-top:12px"><button class="pri" onclick="planEdit(this,'${node}','${name}')">پیش‌نمایش تغییرات</button><button onclick="closeModal()">انصراف</button><span id="e_msg" class="small err"></span></div>`);
+  }catch(e){modal(`<div class="err">${esc(e.message)}</div><button onclick="closeModal()">بستن</button>`)}
+}
+async function planEdit(b,node,name){
+  await withBtn(b,async()=>{try{const p=await post('api/unit/plan',{node,name,description:$('#e_desc').value,args:readForm($('#e_form'))});
+    showPlan(`ویرایش ${name} — ${node}`,p)}catch(e){$('#e_msg').textContent=e.message}});
+}
+async function restoreB(node,name,backup){
+  if(!confirm('این بکاپ بازگردانی شود؟ سرویس ری‌استارت می‌شود.'))return;
+  try{const r=await post('api/unit/restore',{node,name,backup});alert(r.ok?'بازگردانی شد':'ناموفق: '+(r.error||''));closeModal()}catch(e){alert(e.message)}
+}
+function newTunnelForm(){
+  const ir=S.nodes.filter(n=>n.role==='iran'),kh=S.nodes.filter(n=>n.role!=='iran');
+  const box=$('#newtun');box.classList.toggle('hide');busyUI=!box.classList.contains('hide');
+  box.innerHTML=`<h2>تانل جدید</h2><div class="grid">
+    <label>سرور ایران<select id="t_ir">${ir.map(n=>`<option>${esc(n.name)}</option>`)}</select></label>
+    <label>سرور خارج<select id="t_kh">${kh.map(n=>`<option>${esc(n.name)}</option>`)}</select></label>
+    <label>نام<input id="t_name" class="ltr" placeholder="hz1"><span class="h">سرویس: stacktunnel-نام</span></label>
+    <label>پورت تانل (روی ایران)<input id="t_port" class="ltr" placeholder="4100"></label>
+    <label>transport<select id="t_tr"><option>tcp</option><option>udp</option><option>tcp,udp</option><option>ws</option></select></label>
+    <label>پورت‌های TCP کاربر<input id="t_ports" class="ltr" placeholder="8095,8096"></label>
+    <label>پورت‌های UDP<input id="t_udp" class="ltr"></label>
+    <label>padding<input id="t_pad" class="ltr" value="128"></label>
+    <label>conns<input id="t_conns" class="ltr" value="4"></label>
+    <label>rotate<input id="t_rot" class="ltr" value="5m"></label></div>
+    <div class="row" style="margin-top:10px"><button class="pri" onclick="planTunnel(this)">پیش‌نمایش</button><button onclick="newTunnelForm()">بستن</button><span id="t_msg" class="small err"></span></div>`;
+}
+async function planTunnel(b){
+  await withBtn(b,async()=>{try{const p=await post('api/tunnel/plan',{iran:$('#t_ir').value,kharej:$('#t_kh').value,name:$('#t_name').value,
+    tunnel_port:+$('#t_port').value,transport:$('#t_tr').value,ports:$('#t_ports').value,udp:$('#t_udp').value,pad:$('#t_pad').value,conns:$('#t_conns').value,rotate:$('#t_rot').value});
+    $('#newtun').classList.add('hide');showPlan('ساخت تانل جدید',p)}catch(e){$('#t_msg').textContent=e.message}});
+}
+
+/* ---------- servers ---------- */
+function renderNodes(){
+  $('#nodes').innerHTML=S.nodes.map(n=>{
+    const d=nd(n);const s=status(n);const sy=d.sys||{};
+    const svc=(d.services||[]).map(x=>`<span class="pill ${x.active==='active'?'ok':x.active==='failed'?'bad':''}" title="${esc(x.sub)}">${esc(x.unit.replace('.service',''))}</span>`).join('')||'<span class="mut small">—</span>';
+    const lis=(d.listen||[]).map(l=>`<span class="pill">${l.proto}/${l.port} ${esc(l.proc)}</span>`).join('')||'<span class="mut small">—</span>';
+    const mem=sy.mem_total?Math.round(100-100*sy.mem_avail/sy.mem_total)+'%':'-';
+    return `<div class="card node"><div class="hd"><span class="dot ${s}"></span><b>${esc(n.name)}</b>
+      <span class="tag">${n.role==='iran'?'ایران':'خارج'}</span><span class="sp" style="flex:1"></span>
+      <span class="mut small ltr">${esc(n.ip||n.host)}</span></div>
+      ${n.note?`<div class="small mut">${esc(n.note)}</div>`:''}
+      ${n.ok?'':`<div class="err ltr">${esc(n.err)} · آخرین اتصال: ${ago(n.last_ok)}</div>`}
+      <div class="kv" style="margin:6px 0"><span class="mut">سیستم</span><span>${esc(sy.os||'-')}</span>
+      <span class="mut">uptime / load / RAM</span><span class="ltr">${dur(sy.uptime_s)} · ${(sy.load||[]).join(' ')} · ${mem}</span>
+      <span class="mut">stacktunnel</span><span class="ltr">${esc(d.st_version||'-')}</span>
+      <span class="mut">agent / تأخیر</span><span class="ltr">${esc(d.agent||'-')} · ${d._rtt_ms??'-'} ms</span></div>
+      <div class="small mut">سرویس‌ها</div><div>${svc}</div>
+      <details style="margin-top:6px"><summary>پورت‌های باز (${(d.listen||[]).length})</summary>${lis}</details>
+      <div class="row" style="margin-top:8px"><button class="sm" onclick="renameNode('${n.name}')">تغییر نام / یادداشت</button><button class="sm dng" onclick="delNode('${n.name}')">حذف از پنل</button></div></div>`}).join('');
+  $('#installhelp').textContent=`# روی سرور جدید (پوشه‌ی stacktunnel-panel را کپی کنید):
+sudo bash install.sh agent --name NAME --role kharej --allow ${(S.nodes.find(n=>n.role==='iran')||{}).ip||'IRAN_IP'}
+# خروجی: token و fingerprint -> در فرم پایین وارد کنید`;
+}
+async function addNode(b){
+  await withBtn(b,async()=>{$('#n_msg').innerHTML='در حال تست اتصال…';
+    try{await post('api/nodes/add',{name:$('#n_name').value,role:$('#n_role').value,host:$('#n_host').value,port:$('#n_port').value,ip:$('#n_ip').value,
+      probe_ports:$('#n_probe').value,token:$('#n_token').value,fp:$('#n_fp').value,note:$('#n_note').value});
+      $('#n_msg').innerHTML='<span class="okmsg">✅ اضافه شد</span>';load()}
+    catch(e){$('#n_msg').innerHTML=`<span class="err">${esc(e.message)}</span>`}});
+}
+async function renameNode(name){
+  const n=nodeByName(name);const nn=prompt('نام جدید سرور (حروف انگلیسی، عدد، - یا _):',name);if(nn===null)return;
+  const note=prompt('یادداشت (مثلاً دیتاسنتر یا کاربرد):',n.note||'');
+  try{await post('api/nodes/rename',{name,new:nn.trim()||name,note:note??n.note??''});load()}catch(e){alert(e.message)}
+}
+async function delNode(name){if(!confirm(`${name} از پنل حذف شود؟ (روی خود سرور چیزی تغییر نمی‌کند)`))return;await post('api/nodes/del',{name});load()}
+
+/* ---------- speed ---------- */
+function renderSpeedForm(){
+  const sel=$('#sp_node');const cur=sel.value;
+  const kh=S.nodes.filter(n=>n.role!=='iran');
+  if(sel.options.length!==kh.length)sel.innerHTML=kh.map(n=>`<option>${esc(n.name)}</option>`).join('');
+  if(cur)sel.value=cur;spFill(true);
+}
+function spFill(keep){
+  const mode=$('#sp_mode').value;$('#sp_portl').classList.toggle('hide',mode!=='tunnel');
+  const node=$('#sp_node').value;const n=nodeByName(node);if(!n)return;
+  const lis=new Set((nd(n).listen||[]).filter(l=>l.proto==='tcp').map(l=>+l.port));
+  const ports=[];S.pairs.pairs.filter(p=>p.client_node===node).forEach(p=>p.tcp.forEach(x=>ports.push([x,p.client_unit,lis.has(x)])));
+  const sel=$('#sp_port');const cur=sel.value;
+  const html=ports.map(([x,u,busy])=>`<option value="${x}" ${busy?'disabled':''}>${x} (${u})${busy?' — مشغول':''}</option>`).join('')||'<option value="">پورت آزادی در تانل نیست</option>';
+  if(sel.innerHTML!==html){sel.innerHTML=html;if(keep&&cur)sel.value=cur}
+}
+async function runSpeed(b){
+  const mode=$('#sp_mode').value;
+  const body={node:$('#sp_node').value,mb:+$('#sp_mb').value,mode:mode==='tunnel'?'tunnel':'direct',dir:mode==='up'?'up':'down',port:+$('#sp_port').value};
+  if(mode==='tunnel'&&!body.port){$('#sp_msg').innerHTML='<span class="err">یک پورت تانل لازم است. در تب «تانل‌ها» یک پورت آزاد (مثلاً 9557) به این سرور اضافه کنید.</span>';return}
+  await withBtn(b,async()=>{$('#sp_msg').textContent='در حال تست… (حداکثر ۳۰ ثانیه)';
+    try{const r=await post('api/speed',body);$('#sp_msg').innerHTML=r.err?`<span class="err">${esc(r.err)}</span>`:`<span class="okmsg">${r.mbps??0} Mbps</span>`;await load()}
+    catch(e){$('#sp_msg').innerHTML=`<span class="err">${esc(e.message)}</span>`}});
+}
+function renderSpeedHist(){
+  const H=(S.speed_history||[]).slice().reverse();
+  const max=Math.max(1,...H.map(r=>r.mbps||0));
+  $('#sp_hist').innerHTML=H.length?'<table><tr><th>زمان</th><th>سرور</th><th>نوع</th><th>رسید</th><th>زمان</th><th>سرعت</th><th></th></tr>'+H.map(r=>`<tr>
+    <td class="small">${ago(r.ts)}</td><td>${esc(r.node)}</td>
+    <td class="small">${r.mode==='tunnel'?'تانل:'+r.port:r.dir==='up'?'مستقیم آپلود':'مستقیم دانلود'}</td>
+    <td class="ltr small">${fmtB(r.bytes)} / ${fmtB(r.want)} ${r.stalled?'<span class="cell-bad">⚠ ناقص</span>':''}</td>
+    <td class="ltr small">${r.secs}s</td><td class="ltr"><b>${r.mbps??0}</b> Mbps</td>
+    <td><div class="bar"><i style="width:${Math.round(100*(r.mbps||0)/max)}%"></i></div>${r.err?`<div class="err small ltr">${esc(r.err)}</div>`:''}</td></tr>`).join('')+'</table>':'<div class="mut small">هنوز تستی انجام نشده.</div>';
+}
+
+/* ---------- auto-tune ---------- */
+function renderTune(){
+  const T=S.tune||{};const sel=$('#tu_node');const cur=sel.value;
+  const kh=S.nodes.filter(n=>n.role!=='iran');
+  if(sel.options.length!==kh.length)sel.innerHTML=kh.map(n=>`<option>${esc(n.name)}</option>`).join('');
+  if(cur)sel.value=cur;
+  $('#tu_start').classList.toggle('hide',!!T.running);$('#tu_cancel').classList.toggle('hide',!T.running);
+  const pct=T.total?Math.round(100*T.done/T.total):0;
+  $('#tu_prog').innerHTML=T.running?`<div class="small">در حال تست ${esc(T.params.kharej)} — ${T.done}/${T.total}${T.current?` · الان: ${esc(T.current.transport)} conns=${T.current.conns} window=${T.current.window}KB`:''}</div><div class="bar" style="margin-top:4px"><i style="width:${pct}%"></i></div>`
+    :(T.error?`<div class="err">${esc(T.error)}</div>`:'');
+  const R=(T.results||[]).slice().sort((a,b)=>(b.mbps||0)-(a.mbps||0));
+  const max=Math.max(1,...R.map(r=>r.mbps||0));
+  const good=R.filter(r=>!r.stalled&&!r.err&&r.mbps>=0.9*max).sort((a,b)=>a.window-b.window||a.conns-b.conns);
+  const rec=T.running?null:good[0];
+  const spread=R.length?Math.round(100*(max-Math.min(...R.map(r=>r.mbps||0)))/max):0;
+  if(T.params)$('#tu_meta').textContent=`${T.params.kharej} · ${T.params.mb}MB × ${T.params.repeats} · ${T.finished?'پایان '+ago(T.finished):'شروع '+ago(T.started)}`;
+  const pairs=S.pairs.pairs.filter(p=>T.params&&p.client_node===T.params.kharej);
+  const curUnit=pairs[0];let curArgs=null;
+  if(curUnit){const n=nodeByName(curUnit.client_node);const u=(nd(n).units||[]).find(u=>u.name===curUnit.client_unit);if(u)curArgs=u.args}
+  const curC=curArgs?aget(curArgs,'conns','4'):null, curW=curArgs?aget(curArgs,'window','1024'):null;
+  const recHtml=rec?`<div class="card" style="background:#173326;border-color:#2fbf71;margin-bottom:10px;padding:10px 12px"><b>پیشنهاد: ${esc(rec.transport)} · conns=${rec.conns} · window=${rec.window}KB</b> — ${rec.mbps} Mbps
+    <div class="small mut">کوچک‌ترین window که دست‌کم ۹۰٪ بهترین سرعت (${max} Mbps) را می‌دهد؛ window بزرگ‌تر تأخیر زیر بار را بیشتر می‌کند.${spread<15?` تفاوت ترکیب‌ها فقط ${spread}٪ است: احتمالاً گلوگاه جای دیگری است (سقف پهنای باند سرور یا مسیر)، نه این تنظیمات.`:''}</div>
+    ${curUnit?`<button class="sm pri" style="margin-top:6px" onclick="tuneApply(${rec.conns},${rec.window},'${esc(rec.transport)}')">اعمال پیشنهاد روی سرویس اصلی</button>`:''}</div>`:'';
+  $('#tu_res').innerHTML=R.length?recHtml+`${curArgs?`<div class="small mut" style="margin-bottom:6px">تنظیم فعلی سرویس اصلی ${esc(curUnit.client_unit)}: conns=${esc(curC)} · window=${esc(curW)}KB · transport=${esc(curUnit.transport)}</div>`:''}<table><tr><th>#</th><th>transport</th><th>conns</th><th>window</th><th>میانگین</th><th>کمترین</th><th></th><th></th></tr>`+R.map((r,i)=>`<tr style="${i===0?'background:#173326':''}">
+    <td>${i===0?'🏆':i+1}</td><td class="ltr">${esc(r.transport)}</td><td>${r.conns}</td><td>${r.window} KB</td>
+    <td class="ltr"><b>${r.mbps}</b> Mbps</td><td class="ltr small">${r.min}</td>
+    <td style="min-width:120px"><div class="bar"><i style="width:${Math.round(100*(r.mbps||0)/max)}%"></i></div>${r.stalled?'<span class="cell-bad small">⚠ ناقص</span>':''}${r.err?`<div class="err small ltr">${esc(r.err)}</div>`:''}</td>
+    <td>${curUnit&&!T.running?`<button class="sm" onclick="tuneApply(${r.conns},${r.window},'${esc(r.transport)}')">اعمال روی سرویس اصلی</button>`:''}${curArgs&&String(r.conns)===String(curC)&&String(r.window)===String(curW)&&r.transport===(curUnit.transport||'tcp')?' <span class="tag">فعلی</span>':''}</td></tr>`).join('')+'</table>'
+    :'<div class="mut small">هنوز تستی انجام نشده.</div>';
+  $('#tu_log').textContent=(T.log||[]).join('\n');
+}
+async function tuneStart(b){
+  const tr=[];if($('#tu_tcp').checked)tr.push('tcp');if($('#tu_udp').checked)tr.push('udp');
+  const body={kharej:$('#tu_node').value,conns:$('#tu_conns').value,windows:$('#tu_win').value,transports:tr,mb:+$('#tu_mb').value,repeats:+$('#tu_rep').value,
+    tunnel_port:+$('#tu_tport').value,test_port:+$('#tu_dport').value,pad:+$('#tu_pad').value,streams:+$('#tu_str').value};
+  await withBtn(b,async()=>{try{const r=await post('api/tune/start',body);$('#tu_msg').innerHTML=`<span class="okmsg">شروع شد: ${r.total} ترکیب (حدود ${Math.ceil(r.total*(8+body.repeats*6)/60)} دقیقه)</span>`;await load()}
+    catch(e){$('#tu_msg').innerHTML=`<span class="err">${esc(e.message)}</span>`}});
+}
+async function tuneCancel(){await post('api/tune/cancel');$('#tu_msg').textContent='در حال توقف بعد از تست فعلی…'}
+async function tuneApply(conns,win,tr){
+  const p=S.pairs.pairs.find(x=>x.client_node===S.tune.params.kharej);if(!p)return;
+  busyUI=true;modal('<div class="mut">در حال آماده کردن…</div>');
+  try{const pl=await post('api/tune/apply',{kharej:p.client_node,unit:p.client_unit,conns,window:win,transport:tr});showPlan(`conns=${conns} · window=${win}KB روی ${p.client_node}`,pl)}
+  catch(e){modal(`<div class="err">${esc(e.message)}</div><button onclick="closeModal()">بستن</button>`)}
+}
+
+/* ---------- settings ---------- */
+function renderSettings(){
+  const s=S.settings;if(document.activeElement&&document.activeElement.closest('[data-p="set"]'))return;
+  $('#s_int').value=s.interval;$('#s_sni').value=s.sni||'';$('#s_urls').value=(s.urls||[]).join(', ');
+  $('#s_info').textContent=`پنل روی ${s.listen} · رمز: ${s.password_set?'تنظیم شده':'ندارد (فقط از طریق SSH تونل در دسترس است)'}`;
+}
+async function saveSettings(b){
+  await withBtn(b,async()=>{const body={interval:+$('#s_int').value,sni:$('#s_sni').value,urls:$('#s_urls').value.split(',').map(x=>x.trim()).filter(Boolean)};
+    if($('#s_pw').value)body.password=$('#s_pw').value;
+    try{await post('api/settings',body);$('#s_msg').innerHTML='<span class="okmsg">ذخیره شد</span>';$('#s_pw').value=''}catch(e){$('#s_msg').innerHTML=`<span class="err">${esc(e.message)}</span>`}});
+}
+
+load();setInterval(load,5000);
+</script>
+</body>
+</html>
